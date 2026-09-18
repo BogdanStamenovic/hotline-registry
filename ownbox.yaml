@@ -1,0 +1,16 @@
+schema: 1
+name: hotline-registry
+description: Contact the people who consented to be contacted
+homepage: https://github.com/BogdanStamenovic/hotline-registry
+tags: [cli, discord, sip, contacts, python]
+install:
+  platforms: [linux]
+  setup:
+    linux:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+  update:
+    linux: [.venv/bin/python -m pip install -e .]
+  remove: []
+command:
+  linux: .venv/bin/hotline-registry
