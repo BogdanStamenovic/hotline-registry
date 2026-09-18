@@ -37,6 +37,7 @@ HOTLINE_ENV = pathlib.Path(
 IOS_SRC = pathlib.Path(
     os.environ.get("HOTLINE_IOS_SRC", "") or pathlib.Path.home() / "data/hotline-ios/server/src"
 )
+GUILD_ID = os.environ.get("HOTLINE_REGISTRY_GUILD", "")
 
 
 class ContactError(RegistryError):
@@ -102,7 +103,81 @@ def _discord(method: str, path: str, body: dict | None = None) -> Any:
         raise ContactError(f"cannot reach Discord: {exc}") from exc
 
 
-def send_message(person: Person, text: str) -> str:
+def still_a_member(person: Person) -> bool | None:
+    """Is this person still in the server they consented in?
+
+    **This is the consent model's feedback loop, and it exists because the
+    obvious mechanism is unavailable.** Leaving the server is meant to withdraw
+    consent immediately, which would normally be `on_member_remove` -- but that
+    is a privileged Server Members intent, it is switched off for this
+    application, and switching it on is a change only Bogdan can make in the
+    developer portal. Worse, turning it on wrong takes `hotlined`'s gateway down
+    with it.
+
+    So membership is checked where it actually matters: one request, immediately
+    before contacting somebody, against the endpoint that still answers without
+    the intent. `GET /guilds/{g}/members/{u}` returns 200 or 404 for a bot with
+    no privileged intents at all; `GET /guilds/{g}/members` returns 403. Verified
+    against Discord on 2026-09-18, not inferred from the documentation.
+
+    Returns None -- not False -- when the answer cannot be got at all (no guild
+    recorded, Discord unreachable). None means "unknown", and an unknown must not
+    silently become a refusal: a network blip is not a withdrawal of consent.
+    """
+    guild = person.guild_id or GUILD_ID
+    if not guild:
+        return None
+    try:
+        _discord("GET", f"/guilds/{guild}/members/{person.discord_id}")
+        return True
+    except ContactError as exc:
+        if "(404)" in str(exc):
+            return False
+        return None
+
+
+def check_membership(person: Person, registry: Any = None) -> None:
+    """Refuse to contact somebody who has left, and write that down if asked.
+
+    Called by both `send_message` and `call_person`, so the check cannot be
+    skipped by using one rather than the other.
+    """
+    present = still_a_member(person)
+    if present is False:
+        if registry is not None:
+            registry.revoke(person.discord_id)
+        raise ContactError(
+            f"{person.name} has left the server, which withdraws consent. "
+            "Not contacting them."
+        )
+
+
+def reconcile(registry: Any) -> tuple[list[Person], list[Person], list[Person]]:
+    """Sweep the whole registry against the server. Returns (present, left, unknown).
+
+    The sweep is what catches somebody who left while nothing was trying to
+    contact them. It is a command rather than a timer because it costs one
+    request per person and the per-contact check above already covers the case
+    that matters.
+    """
+    present: list[Person] = []
+    left: list[Person] = []
+    unknown: list[Person] = []
+    for person in registry.all(include_revoked=True):
+        if person.revoked:
+            continue
+        state = still_a_member(person)
+        if state is True:
+            present.append(person)
+        elif state is False:
+            registry.revoke(person.discord_id)
+            left.append(person)
+        else:
+            unknown.append(person)
+    return present, left, unknown
+
+
+def send_message(person: Person, text: str, registry: Any = None) -> str:
     """DM them. Returns the message id.
 
     Opening the DM channel is a separate call that Discord makes idempotent --
@@ -116,6 +191,7 @@ def send_message(person: Person, text: str) -> str:
         )
     if not text.strip():
         raise ContactError("refusing to send an empty message")
+    check_membership(person, registry)
     channel = _discord("POST", "/users/@me/channels", {"recipient_id": person.discord_id})
     channel_id = str(channel.get("id", ""))
     if not channel_id:
@@ -175,6 +251,7 @@ def call_person(
     timeout: float = 600.0,
     ring_timeout: float = 45.0,
     wait: bool = True,
+    registry: Any = None,
 ) -> CallResult:
     """Ring their Linphone and, unless `wait` is false, come back with what they said.
 
@@ -189,6 +266,7 @@ def call_person(
             f"{person.name} left the SIP field blank, which means 'message me, do not "
             "ring me'. Use `hotline-registry message` instead."
         )
+    check_membership(person, registry)
     client = _ios_client()
     try:
         outcome = client.place_call(

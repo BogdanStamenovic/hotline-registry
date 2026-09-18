@@ -27,7 +27,14 @@ from collections.abc import Sequence
 from typing import NoReturn
 
 from . import __version__
-from .contact import CallResult, ContactError, call_health, call_person, send_message
+from .contact import (
+    CallResult,
+    ContactError,
+    call_health,
+    call_person,
+    reconcile,
+    send_message,
+)
 from .registry import Person, Registry, RegistryError
 
 EXIT_OK = 0
@@ -91,6 +98,12 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="print who would be rung at which address, ring nothing")
 
     sub.add_parser("status", help="whether messaging and calling actually work right now")
+
+    rec = sub.add_parser(
+        "reconcile",
+        help="check everyone is still in the server, and revoke those who left")
+    rec.add_argument("--dry-run", action="store_true",
+                     help="report who has left, change nothing")
 
     revoke = sub.add_parser(
         "revoke", help="mark somebody uncontactable (they left, or asked not to be contacted)")
@@ -206,6 +219,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"messaging     no -- {exc}")
             return EXIT_OK
 
+        if args.command == "reconcile":
+            if args.dry_run:
+                from .contact import still_a_member
+
+                for person in registry.all():
+                    state = still_a_member(person)
+                    verdict = {True: "present", False: "HAS LEFT", None: "unknown"}[state]
+                    print(f"{person.name:<20} {verdict}")
+                return EXIT_OK
+            present, left, unknown = reconcile(registry)
+            for person in left:
+                print(f"revoked {person.name} ({person.discord_name}) -- left the server")
+            for person in unknown:
+                log(f"could not check {person.name}; leaving them alone")
+            log(f"{len(present)} still present, {len(left)} left, {len(unknown)} unknown")
+            return EXIT_OK
+
         if args.command == "revoke":
             person = registry.resolve(args.who)
             if args.dry_run:
@@ -226,7 +256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(text)
                 return EXIT_OK
             vlog(f"opening a DM channel with {person.discord_id}")
-            message_id = send_message(person, text)
+            message_id = send_message(person, text, registry)
             log(f"sent to {person.name}")
             print(message_id)
             return EXIT_OK
@@ -250,6 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result: CallResult = call_person(
                 person, reason, context=args.context, source=args.source,
                 timeout=args.timeout, ring_timeout=args.ring_timeout, wait=not args.no_wait,
+                registry=registry,
             )
             if result.fake:
                 print("hotline-registry: error: the doorbell is fake -- nothing rang",
