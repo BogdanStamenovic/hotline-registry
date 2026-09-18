@@ -133,6 +133,14 @@ async def _grant_registered(interaction: discord.Interaction) -> bool:
     member = interaction.user
     if guild is None or not isinstance(member, discord.Member):
         return False
+    if getattr(guild, "owner_id", None) == member.id:
+        # Nobody can give the owner a role, including an administrator bot --
+        # the owner sits above every role in the hierarchy by definition. They
+        # also already see every channel, so there is nothing to grant and
+        # nothing to apologise for. Without this the very first person to fill
+        # in the form -- Bogdan, in his own server -- is told something went
+        # wrong when nothing did.
+        return True
     role = discord.utils.get(guild.roles, name=REGISTERED_ROLE)
     if role is None:
         log.warning("no %r role in guild %s", REGISTERED_ROLE, guild.id)

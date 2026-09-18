@@ -143,3 +143,27 @@ def test_leaving_the_server_revokes_consent(registry, monkeypatch):
     monkeypatch.setattr("hotline_registry.cog.GUILD_ID", 0)
     asyncio.run(cog.on_member_remove(member))
     assert not registry.resolve("Milos").messageable
+
+
+def test_the_guild_owner_is_not_told_the_role_failed(registry, monkeypatch):
+    """Nobody can give the owner a role, including an admin bot -- they are above
+    every role by definition, and they already see every channel. The first
+    person to fill in this form is the owner, in his own server."""
+    monkeypatch.setattr(discord, "Member", FakeMember)
+    member = FakeMember(999, "bogdan#0")
+    guild = FakeGuild(777, with_role=True)
+    guild.owner_id = 999
+    interaction = FakeInteraction(member, guild)
+
+    async def go():
+        modal = RegistryModal(registry)
+        answers = dict(zip((id(c) for c in modal.children), ["Bogdan", "", "everything"]))
+        monkeypatch.setattr(type(modal.children[0]), "value",
+                            property(lambda self: answers.get(id(self), "")), raising=False)
+        await modal.callback(interaction)
+
+    asyncio.run(go())
+    content, _ = interaction.response.messages[0]
+    assert "could not give you the member role" not in content
+    assert member.added == []
+    assert registry.people["999"].messageable
