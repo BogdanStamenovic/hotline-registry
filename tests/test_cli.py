@@ -154,3 +154,13 @@ def test_status_reports_both_channels(registry, store, capsys, monkeypatch):
     assert code == 0
     assert "2 contactable, 1 of them callable" in out
     assert "daemon down" in out
+
+
+def test_a_refused_call_is_not_narrated_as_a_ring(registry, store, capsys, monkeypatch):
+    """Ana gave no SIP. Saying "ringing Ana at " and then refusing describes a
+    call that never happened."""
+    monkeypatch.setattr(contact, "_ios_client", lambda: pytest.fail("must not ring"))
+    code, _, err = run(["call", "Ana", "are you free?"], store, capsys)
+    assert code == 1
+    assert "ringing Ana" not in err
+    assert "do not ring me" in err

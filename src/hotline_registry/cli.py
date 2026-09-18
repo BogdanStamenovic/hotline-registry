@@ -276,7 +276,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"  reason   {reason}")
                 print(f"  context  {args.context or '(none)'}")
                 return EXIT_OK
-            log(f"ringing {person.name} at {person.sip}")
+            # Narrated only once it is actually going to happen. The refusals
+            # live in `call_person`, where they cannot be skipped -- but printing
+            # "ringing Bogdan at " and then refusing describes a call that never
+            # was, which is the one thing narration must never do.
+            if person.callable_:
+                log(f"ringing {person.name} at {person.sip}")
             result: CallResult = call_person(
                 person, reason, context=args.context, source=args.source,
                 timeout=args.timeout, ring_timeout=args.ring_timeout, wait=not args.no_wait,
