@@ -310,3 +310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RegistryError as exc:
         print(f"hotline-registry: error: {exc}", file=sys.stderr)
         return EXIT_FAILED
+
+
+if __name__ == "__main__":  # `python -m hotline_registry.cli`, which the shim falls back to
+    raise SystemExit(main())
