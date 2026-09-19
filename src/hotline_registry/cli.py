@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from typing import NoReturn
 
 from . import __version__
+from .admin import publish
 from .contact import (
     CallResult,
     ContactError,
@@ -98,6 +99,15 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="print who would be rung at which address, ring nothing")
 
     sub.add_parser("status", help="whether messaging and calling actually work right now")
+    pub = sub.add_parser(
+        "publish",
+        help="rewrite the private admin channel with the registry as it stands",
+    )
+    pub.add_argument(
+        "--channel",
+        default="",
+        help="channel id (default: $HOTLINE_REGISTRY_ADMIN_CHANNEL)",
+    )
 
     rec = sub.add_parser(
         "reconcile",
@@ -176,6 +186,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.only_callable:
                 people = [p for p in people if p.callable_]
             _print_roster(people, args.json)
+            return EXIT_OK
+
+        if args.command == "publish":
+            # The cog already does this on every registration. This is for the
+            # cases it cannot cover: a channel recreated by hand, a mirror that
+            # failed while Discord was down, or simply wanting to see it refresh.
+            posted = publish(registry, args.channel)
+            if not posted:
+                log("hotline-registry: nothing was posted -- is "
+                    "HOTLINE_REGISTRY_ADMIN_CHANNEL set, and can the bot see that channel?")
+                return EXIT_FAILED
+            log(f"republished the admin channel ({posted} message(s))")
             return EXIT_OK
 
         if args.command == "find":

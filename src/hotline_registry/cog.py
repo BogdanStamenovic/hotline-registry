@@ -28,6 +28,7 @@ import os
 
 import discord
 
+from .admin import publish
 from .registry import Person, Registry, normalise_sip
 
 log = logging.getLogger("hotline-registry.cog")
@@ -108,6 +109,15 @@ class RegistryModal(discord.ui.Modal):
                 ephemeral=True,
             )
             return
+
+        # The admin channel is a view of the registry, so it is rewritten on every
+        # write rather than posted once. Never allowed to fail a registration:
+        # the person IS registered at this point, and telling them otherwise
+        # because Discord refused a mirror post would be a lie.
+        try:
+            publish(self.registry)
+        except Exception:
+            log.exception("could not republish the admin channel")
 
         granted = await _grant_registered(interaction)
         how = "message you on Discord" + (" and ring your Linphone" if sip else "")
