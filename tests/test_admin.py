@@ -7,6 +7,8 @@ somebody registers.
 
 from __future__ import annotations
 
+import pytest
+
 from hotline_registry.admin import LIMIT, publish, render
 from hotline_registry.registry import Person, Registry
 
@@ -110,3 +112,34 @@ def test_publish_replaces_its_own_messages_rather_than_appending(monkeypatch, tm
     assert ("DELETE", "/channels/42/messages/old1") in calls
     # Somebody else's message is not ours to delete.
     assert ("DELETE", "/channels/42/messages/human") not in calls
+
+
+def test_the_suite_cannot_reach_discord():
+    """The guard that exists because the suite once posted its own fixtures into
+    Bogdan's real private channel, over the real roster."""
+    from hotline_registry import admin
+
+    with pytest.raises(RuntimeError, match="tried to talk to Discord"):
+        admin._request("GET", "/users/@me", "token")
+
+
+def test_the_guard_is_what_stands_between_a_registration_and_discord(registry, monkeypatch):
+    """The conftest guard is load-bearing, not decorative.
+
+    Swap it for a recorder and a single modal submit reaches the REAL channel id
+    out of ~/data/hotline/.env -- which is exactly what happened on 2026-09-20,
+    when the suite posted its own fixtures over the roster in Bogdan's private
+    channel. This test fails if the registration path stops republishing, which
+    is the moment the guard could be reconsidered.
+    """
+    from tests.test_cog import submit
+
+    reached: list[str] = []
+    monkeypatch.setattr(
+        "hotline_registry.admin._request",
+        lambda method, path, *a, **k: reached.append(path),
+    )
+    submit(registry, ["Ana", "", "design"], monkeypatch=monkeypatch)
+
+    assert reached, "a registration no longer republishes the admin channel"
+    assert any("/channels/" in path for path in reached), reached
