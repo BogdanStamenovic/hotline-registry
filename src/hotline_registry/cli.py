@@ -115,6 +115,9 @@ def _build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--dry-run", action="store_true",
                      help="report who has left, change nothing")
 
+    from .devices_cli import add_parser as add_devices_parser
+
+    add_devices_parser(sub)
     revoke = sub.add_parser(
         "revoke", help="mark somebody uncontactable (they left, or asked not to be contacted)")
     revoke.add_argument("who")
@@ -179,6 +182,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(message, file=sys.stderr)
 
     try:
+        if args.command == "devices":
+            # Its own store; it must not need (or create) the people registry.
+            from .devices_cli import run as run_devices
+
+            return run_devices(args, log)
+
         registry = Registry(args.store)
 
         if args.command == "list":

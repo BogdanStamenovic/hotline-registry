@@ -29,6 +29,12 @@ def _no_real_discord(monkeypatch):
     monkeypatch.setattr("hotline_registry.admin._request", refuse)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_device_map(tmp_path, monkeypatch):
+    """Nor the real device map: publish() appends it, and it holds real addresses."""
+    monkeypatch.setenv("HOTLINE_REGISTRY_DEVICES", str(tmp_path / "devices.json"))
+
+
 @pytest.fixture()
 def store(tmp_path):
     return tmp_path / "registry.json"

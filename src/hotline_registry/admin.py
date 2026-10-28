@@ -58,6 +58,30 @@ def _request(method: str, path: str, token: str, body: dict | None = None) -> ob
     return json.loads(raw) if raw else None
 
 
+def _chunk(blocks: list[str]) -> list[str]:
+    """Join blocks into messages under Discord's limit, splitting only on line breaks."""
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        if current and len(current) + len(block) + 1 > LIMIT:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n{block}" if current else block
+        while len(current) > LIMIT:  # one person with a very long answer
+            # rfind returns -1 when there is no line break to split on, and
+            # `-1 or LIMIT` is -1 -- which silently trimmed one character instead
+            # of splitting and left the chunk over the limit. Discord would have
+            # rejected it at the worst moment: when somebody had just registered.
+            cut = current.rfind("\n", 0, LIMIT)
+            if cut <= 0:
+                cut = LIMIT
+            chunks.append(current[:cut])
+            current = current[cut:].lstrip("\n")
+    if current.strip():
+        chunks.append(current)
+    return chunks
+
+
 def render(people: list[Person]) -> list[str]:
     """The roster as Discord messages, split on person boundaries.
 
@@ -87,26 +111,26 @@ def render(people: list[Person]) -> list[str]:
     for person in sorted(gone, key=lambda p: p.name.lower()):
         blocks.append(f"\n~~**{person.name}** — {person.discord_name}~~ · revoked, do not contact")
 
-    chunks: list[str] = []
-    current = ""
-    for block in blocks:
-        if current and len(current) + len(block) + 1 > LIMIT:
-            chunks.append(current)
-            current = ""
-        current = f"{current}\n{block}" if current else block
-        while len(current) > LIMIT:  # one person with a very long answer
-            # rfind returns -1 when there is no line break to split on, and
-            # `-1 or LIMIT` is -1 -- which silently trimmed one character instead
-            # of splitting and left the chunk over the limit. Discord would have
-            # rejected it at the worst moment: when somebody had just registered.
-            cut = current.rfind("\n", 0, LIMIT)
-            if cut <= 0:
-                cut = LIMIT
-            chunks.append(current[:cut])
-            current = current[cut:].lstrip("\n")
-    if current.strip():
-        chunks.append(current)
-    return chunks
+    return _chunk(blocks)
+
+
+def _device_chunks() -> list[str]:
+    """The device map, as a second section of the same channel.
+
+    One channel, published as one document: `publish` deletes every message the
+    bot owns before posting, so a device map published on its own would wipe the
+    roster, and the roster would wipe the map. A missing or unreadable map is
+    simply left out; the people roster must still go up.
+    """
+    from .devices import DeviceMap
+    from .devices import render as render_devices
+
+    try:
+        dmap = DeviceMap()
+    except Exception as exc:  # noqa: BLE001 - the roster must not fail because of the map
+        log.warning("not mirroring the device map: %s", exc)
+        return []
+    return _chunk(render_devices(dmap)) if dmap.devices else []
 
 
 def publish(registry: Registry, channel_id: str = "", token: str = "") -> int:
@@ -140,7 +164,7 @@ def publish(registry: Registry, channel_id: str = "", token: str = "") -> int:
                 _request("DELETE", f"/channels/{channel_id}/messages/{message['id']}", token)
 
         posted = 0
-        for chunk in render(registry.all(include_revoked=True)):
+        for chunk in render(registry.all(include_revoked=True)) + _device_chunks():
             _request("POST", f"/channels/{channel_id}/messages", token, {"content": chunk})
             posted += 1
         return posted
