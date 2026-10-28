@@ -72,6 +72,9 @@ BASE_UNITS = (
     # archserver, pigion (Raspberry Pi OS) and the arch laptop on 2026-10-28.
     "man-db", "shadow.", "archlinux-keyring", "apt-daily", "dpkg-db-backup", "e2scrub", "fstrim",
     "logrotate", "rpi-", "org.gnome.", "org.freedesktop.", "localsearch", "tracker-",
+    # Ubuntu desktop (teamserbia, 2026-10-28).
+    "motd-news", "plocate-updatedb", "rsyslog", "touchegg", "launchpadlib-cache-clean",
+    "kerneloops", "lightdm", "cups-browsed", "anacron",
 )
 
 
