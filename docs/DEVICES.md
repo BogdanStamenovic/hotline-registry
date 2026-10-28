@@ -93,26 +93,38 @@ error — the same contract as the rest of the CLI.
 
 - `~/.local/share/hotline-registry/devices.json`, mode 600, beside
   `registry.json`, **not in the repo** (it holds addresses and MACs, and the repo
-  is public). Atomic writes under an flock, the same as the registry.
-- `HOTLINE_REGISTRY_DEVICES` overrides the path.
-- Every write and every `check` republishes the map into the private admin
-  channel, the same way the people roster is published. The channel shows the
-  current truth, including what is contradicted right now.
+  is public). Written atomically with the mode set before the rename, the same
+  as the people registry (no lock: writers are one person or one daily task).
+- `HOTLINE_REGISTRY_DEVICES` overrides the path; `--map PATH` points one command
+  at a scratch map, and a scratch map never touches the admin channel.
+- The admin channel is published as one document, the people roster then the
+  map, because `publish` replaces every message the bot owns there. Every edit
+  republishes it; `check` republishes only when a duty changed state, so a
+  quiet day sends him no notification.
 
 ## Keeping it true
 
 A map that is only written by hand decays the way handoffs do. Two things keep it
 honest:
 
-1. **`check` runs daily** from a wake shell task on archserver. A contradiction
-   lands in the admin channel when it appears, not when someone needs the map.
+1. **`check` runs daily** at 10:00 from the wake shell task `device-map-daily`
+   on archserver (`scripts/device-check.sh`). A state change republishes the
+   admin channel, and a contradiction is also sent to the operator (hotline-80),
+   when it appears rather than when someone next needs the map.
 2. **`discover`** shows the other direction: work that is running but that
    nobody has written down.
 
 ## Seed
 
-Seeded from the 2026-10-28 survey, and kept only where a probe verified it.
-Facts the survey could not verify go in as `unprobed`.
+Seeded from the 2026-10-28 survey: 4 devices (archserver, pigion, arch, phone)
+and 37 duties. First live check: 35 verified, 0 contradicted, 2 unprobed (the
+phone has no ssh). `discover` then found nothing unclaimed on archserver or
+pigion once distro timers and desktop-session units were filtered out; on the
+laptop it found `subjectdesk`, which was added.
+
+All three result states were exercised on real machines: docker (stopped on
+purpose) came back contradicted, the offline `djole` came back unknown after the
+6 s ssh connect timeout, everything else verified.
 
 ## Limitations
 

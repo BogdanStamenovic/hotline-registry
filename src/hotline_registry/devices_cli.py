@@ -127,7 +127,11 @@ def run(args: argparse.Namespace, log: Callable[[str], None]) -> int:
         return 2
 
     def republish() -> None:
-        # The admin channel shows the people roster and this map together.
+        # The admin channel shows the people roster and the DEFAULT map together.
+        # A scratch map given with --map is somebody's experiment; publishing
+        # would post the real map in its name and notify him for nothing.
+        if args.map is not None:
+            return
         if not publish(Registry(getattr(args, "store", None))):
             log("note: the admin channel was not republished (see the warning above)")
 
@@ -153,7 +157,9 @@ def run(args: argparse.Namespace, log: Callable[[str], None]) -> int:
     if cmd == "check":
         changes = check(dmap, args.device)
         dmap.save()
-        if not args.no_publish:
+        # Only when something moved. A republish is a fresh Discord notification,
+        # and a daily check that changed nothing must not ping him every day.
+        if not args.no_publish and any(b != a for _d, b, a in changes):
             republish()
         shown = [c for c in changes if not args.changes_only or c[1] != c[2]]
         if args.json:

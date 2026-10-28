@@ -249,3 +249,21 @@ def test_cli_claim_check_where(tmp_path, monkeypatch, capsys) -> None:
     assert main(["devices", "--map", m, "claim", "here", "x", "y", "--command", "true", "--dry-run"]) == 0
     assert "here/x" not in DeviceMap(m).duties
     assert main(["devices", "--map", m, "claim", "nowhere", "x", "y"]) == 1
+
+
+def test_check_republishes_only_when_something_changed(tmp_path, monkeypatch) -> None:
+    """A daily check that changed nothing must not ping him every day."""
+    calls: list[int] = []
+    monkeypatch.setattr(admin, "publish", lambda *a, **k: calls.append(1) or 1)
+    monkeypatch.setenv("HOTLINE_REGISTRY_DEVICES", str(tmp_path / "default.json"))
+    flag = tmp_path / "up"
+    flag.write_text("")
+    assert main(["devices", "add-device", "here", "--local"]) == 0
+    assert main(["devices", "claim", "here", "f", "flag exists", "--command", f"test -e {flag}"]) == 0
+    calls.clear()
+    assert main(["devices", "check"]) == 0   # unknown -> verified: publish
+    assert main(["devices", "check"]) == 0   # verified -> verified: quiet
+    assert len(calls) == 1
+    flag.unlink()
+    assert main(["devices", "check"]) == 1   # verified -> contradicted: publish
+    assert len(calls) == 2

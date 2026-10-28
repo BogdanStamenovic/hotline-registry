@@ -68,6 +68,10 @@ BASE_UNITS = (
     "gnome-", "evolution-", "dconf", "pipewire", "wireplumber", "gcr-", "obex", "filter-chain",
     "mpris-proxy", "dirmngr@", "iwd", "cron", "cronie", "sshd", "ssh.", "tailscaled", "nvidia",
     "bolt", "containerd", "docker", "profiler", "dbus-", "gdm", "fwupd", "thermald", "irqbalance",
+    # Distro housekeeping timers and desktop-session plumbing, measured on
+    # archserver, pigion (Raspberry Pi OS) and the arch laptop on 2026-10-28.
+    "man-db", "shadow.", "archlinux-keyring", "apt-daily", "dpkg-db-backup", "e2scrub", "fstrim",
+    "logrotate", "rpi-", "org.gnome.", "org.freedesktop.", "localsearch", "tracker-",
 )
 
 
@@ -391,7 +395,7 @@ def render(dmap: DeviceMap) -> list[str]:
         f"**Device map — {len(dmap.devices)} devices, {len(dmap.duties)} duties**\n"
         f"{MARK['verified']} {counts['verified']} verified · {MARK['contradicted']} "
         f"{counts['contradicted']} contradicted · {MARK['unknown']} {counts['unknown']} unknown · "
-        f"{MARK['unprobed']} {counts['unprobed']} unprobed. Rewritten on every change and every check."
+        f"{MARK['unprobed']} {counts['unprobed']} unprobed. Rewritten whenever a duty is edited or changes state."
     )
     blocks = [header]
     for device in sorted(dmap.devices.values(), key=lambda d: d.name):

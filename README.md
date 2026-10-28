@@ -121,6 +121,47 @@ answer=$(hotline-registry call Milos --context "$(cat brief.md)" "can you review
 hotline-registry status
 ```
 
+## Device map
+
+The second half of the registry: which machine handles which part of the
+system, and whether that is still true. Separate from the people registry in
+everything but the command name and the admin channel (spec and reasoning:
+[docs/DEVICES.md](docs/DEVICES.md)).
+
+Each device has **duties**. Each duty carries a **probe** (a systemd unit is
+active, a shell command exits 0, or this device has the newest copy of a file),
+and `check` runs the probes on the live machines over ssh:
+
+| Result | Meaning |
+|---|---|
+| ✅ verified | the probe ran and the claim holds |
+| ❌ contradicted | the probe ran and the claim is false |
+| ❔ unknown | the device could not be asked (asleep, offline): says nothing either way |
+| ➖ unprobed | no probe defined, e.g. the phone |
+
+| Command | What it does |
+|---|---|
+| `devices list` / `show DEVICE` | the map, with the last result of every duty |
+| `devices where QUERY` | which device handles QUERY (`where wake`, `where keyring`) |
+| `devices check [DEVICE…]` | run the probes now; exit 1 if anything is contradicted |
+| `devices discover DEVICE` | running units on a device that no duty claims |
+| `devices add-device NAME --ssh HOST --kind K --power P` | add or update a device |
+| `devices claim DEVICE SLUG TITLE --unit U \| --command C \| --freshest PATH --among A,B` | add or update a duty |
+| `devices drop ID` / `drop-device NAME` | remove one |
+
+`--json` on every read, `--dry-run` on every write. The store is
+`~/.local/share/hotline-registry/devices.json` (mode 600, not in this repo,
+which is public). A daily wake task (`device-map-daily`, 10:00) runs
+`scripts/device-check.sh`, which re-checks everything, republishes the admin
+channel when anything changed, and tells hotline-80 about contradictions.
+
+```
+hotline-registry devices where keyring
+hotline-registry devices check pigion
+hotline-registry devices claim pigion wake-server "wake server" --unit wake-server.service \
+    --if-down "nothing wakes on schedule"
+```
+
 ## Limitations
 
 **What works today**
@@ -148,6 +189,14 @@ hotline-registry status
 - **No rate limiting of its own.** It relies on Discord's, and a 429 surfaces as
   a failed command rather than being retried.
 - **One registry, one server.** `guild_id` is recorded but nothing reads it.
+- **The device map's probes read state, they do not prove a service works.** An
+  active unit can be broken; health checks are a different job.
+- **Device probes need key-based ssh from the machine running `check`**
+  (archserver). The phone and the Windows boxes can only carry unprobed duties,
+  and if archserver is off nobody checks: the admin channel keeps the last
+  result, with its date.
+- **`freshest` compares mtimes**, so a file touched without being changed reads
+  as newer.
 
 **Things worth knowing before trusting a call**
 
