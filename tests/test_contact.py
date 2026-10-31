@@ -144,3 +144,19 @@ def test_reconcile_revokes_only_the_ones_that_404(registry, monkeypatch):
     assert [p.name for p in left] == ["Ana"]
     assert unknown == []
     assert not registry.resolve("Ana").messageable
+
+
+def test_the_call_client_comes_from_hotline_call_once_calls_moved_there(tmp_path, monkeypatch):
+    # Calls moved out of hotline-ios into hotline-call on 2026-10-31; the
+    # client is looked for there first.
+    import sys
+
+    package = tmp_path / "hotline_call"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "client.py").write_text("WHERE = 'hotline-call'\n")
+    monkeypatch.setattr(contact, "CALL_SRCS", [tmp_path])
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    for name in ("hotline_call", "hotline_call.client"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    assert contact._ios_client().WHERE == "hotline-call"

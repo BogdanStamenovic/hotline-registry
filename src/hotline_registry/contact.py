@@ -19,6 +19,7 @@ bug in the CLI cannot ring somebody who never agreed to be rung.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import pathlib
@@ -37,6 +38,14 @@ HOTLINE_ENV = pathlib.Path(
 IOS_SRC = pathlib.Path(
     os.environ.get("HOTLINE_IOS_SRC", "") or pathlib.Path.home() / "data/hotline-ios/server/src"
 )
+CALL_SRCS = [pathlib.Path(p) for p in (
+    os.environ.get("HOTLINE_CALL_SRC", ""),
+    str(pathlib.Path.home() / ".local/share/ownbox/tools/hotline-call/src"),
+    str(pathlib.Path.home() / "data/hotline-call/src"),
+) if p]
+"""Where `hotline_call.client` is looked for. Phone calls moved out of hotline-ios
+into hotline-call on 2026-10-31; the ownbox checkout is what runs, the dev
+checkout is the fallback."""
 GUILD_ID = os.environ.get("HOTLINE_REGISTRY_GUILD", "")
 
 
@@ -201,30 +210,34 @@ def send_message(person: Person, text: str, registry: Any = None) -> str:
 
 
 def _ios_client() -> Any:
-    """`hotline_ios.client`, imported from wherever hotline-ios actually is.
+    """The call client: `hotline_call.client`, else the older `hotline_ios.client`.
 
     A soft dependency rather than a hard one, because this repository is public
-    and hotline-ios is a sibling checkout rather than something pip can fetch.
-    The module itself is standard-library-only by its own design, so putting its
+    and the call client is a sibling checkout rather than something pip can
+    fetch. The module is standard-library-only by its own design, so putting its
     source directory on the path costs nothing and pulls in no wheels.
+
+    hotline-call is tried first: since 2026-10-31 it owns calls and hotline-ios
+    no longer has a client. hotline-ios is still tried so a box that has not cut
+    over keeps ringing people.
     """
-    try:
-        from hotline_ios import client  # type: ignore[import-not-found,unused-ignore]
-
-        return client
-    except ImportError:
-        pass
-    if IOS_SRC.is_dir() and str(IOS_SRC) not in sys.path:
-        sys.path.insert(0, str(IOS_SRC))
-    try:
-        from hotline_ios import client  # type: ignore[import-not-found,unused-ignore]
-
-        return client
-    except ImportError as exc:
-        raise ContactError(
-            f"cannot import hotline_ios.client (looked in {IOS_SRC}). "
-            "Calling needs hotline-ios; messaging does not."
-        ) from exc
+    for module, roots in (("hotline_call", CALL_SRCS), ("hotline_ios", [IOS_SRC])):
+        try:
+            return importlib.import_module(f"{module}.client")
+        except ImportError:
+            pass
+        for root in roots:
+            if root.is_dir() and str(root) not in sys.path:
+                sys.path.insert(0, str(root))
+                try:
+                    return importlib.import_module(f"{module}.client")
+                except ImportError:
+                    continue
+    looked = ", ".join(str(p) for p in [*CALL_SRCS, IOS_SRC])
+    raise ContactError(
+        f"cannot import hotline_call.client or hotline_ios.client (looked in {looked}). "
+        "Calling needs hotline-call; messaging does not."
+    )
 
 
 @dataclass
@@ -286,7 +299,7 @@ def call_person(
             f"registry's SIP generalisation ({exc})"
         ) from exc
     except Exception as exc:  # the client raises DaemonError/CallTimeout
-        raise ContactError(f"hotline-iosd could not place the call: {exc}") from exc
+        raise ContactError(f"hotline-calld could not place the call: {exc}") from exc
     return CallResult(
         state=outcome.state, reply=outcome.reply, transcript=outcome.transcript,
         transport=outcome.transport, fake=outcome.fake, detail=outcome.detail,

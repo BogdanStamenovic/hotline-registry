@@ -74,7 +74,8 @@ Then, in `hotlined`, load the cog (`hotline` does this already if
 |---|---|---|
 | `HOTLINE_REGISTRY_STORE` | `~/.local/share/hotline-registry/registry.json` | the consent record |
 | `HOTLINE_ENV` | `~/data/hotline/.env` | where the bot token is read from |
-| `HOTLINE_IOS_SRC` | `~/data/hotline-ios/server/src` | where `hotline_ios.client` is imported from |
+| `HOTLINE_CALL_SRC` | ownbox's hotline-call checkout, then `~/data/hotline-call/src` | where `hotline_call.client` is imported from |
+| `HOTLINE_IOS_SRC` | `~/data/hotline-ios/server/src` | the pre-split fallback, `hotline_ios.client` |
 | `HOTLINE_REGISTRY_GUILD` | unset | restrict the cog's join/leave handling to one guild |
 
 ## Usage
