@@ -133,7 +133,12 @@ def still_a_member(person: Person) -> bool | None:
     recorded, Discord unreachable). None means "unknown", and an unknown must not
     silently become a refusal: a network blip is not a withdrawal of consent.
     """
-    guild = person.guild_id or GUILD_ID
+    if not person.has_discord:
+        return None
+    # A hand-added row is only tied to the server if the adder saw them in it
+    # (`guild_id` recorded). Falling back to the default guild for one would
+    # revoke somebody Bogdan added precisely because they are NOT a member.
+    guild = person.guild_id or ("" if person.admin_added else GUILD_ID)
     if not guild:
         return None
     try:
@@ -175,6 +180,8 @@ def reconcile(registry: Any) -> tuple[list[Person], list[Person], list[Person]]:
     for person in registry.all(include_revoked=True):
         if person.revoked:
             continue
+        if person.admin_added and not person.guild_id:
+            continue  # not membership-based consent; nothing to reconcile
         state = still_a_member(person)
         if state is True:
             present.append(person)
@@ -186,6 +193,46 @@ def reconcile(registry: Any) -> tuple[list[Person], list[Person], list[Person]]:
     return present, left, unknown
 
 
+def introduction(person: Person) -> str:
+    """The one line a hand-added person hears the first time an agent reaches them.
+
+    Empty for a form row (they know how they got here: they filled the form in)
+    and for an admin row already introduced. "Reply STOP" is a request to a
+    human: nothing reads DM replies automatically, so whoever sent the message
+    has to act on it with `hotline-registry revoke`.
+    """
+    if not person.admin_added or person.introduced_at:
+        return ""
+    ways = []
+    if person.guild_id:
+        ways.append("leave the Claude contacts Discord server")
+    ways.append("reply STOP")
+    return (
+        "(Bogdan added you to Claude's contact list by hand, which is why an agent "
+        f"can reach you. To opt out, {' or '.join(ways)} and you will not be "
+        "contacted again.)"
+    )
+
+
+def compose_message(person: Person, text: str) -> str:
+    """The DM as it will actually be sent: their text, then the introduction if due."""
+    intro = introduction(person)
+    if not intro:
+        return text[:1900]
+    return f"{text[:1900 - len(intro) - 2]}\n\n{intro}"
+
+
+def call_context(person: Person, context: str) -> str:
+    """`context` for the voice on the line, with the introduction as an instruction."""
+    intro = introduction(person)
+    if not intro:
+        return context
+    spoken = intro.strip("()").replace("reply STOP", "say so on this call")
+    line = (f"Early in the call, tell them this in one sentence: {spoken} "
+            "If they opt out, say that you will pass it on and include it in your reply.")
+    return f"{line}\n\n{context}" if context else line
+
+
 def send_message(person: Person, text: str, registry: Any = None) -> str:
     """DM them. Returns the message id.
 
@@ -194,6 +241,11 @@ def send_message(person: Person, text: str, registry: Any = None) -> str:
     channel rather than a second one -- so there is nothing to cache and nothing
     to go stale.
     """
+    if not person.has_discord and not person.revoked:
+        raise ContactError(
+            f"{person.name} was added by hand without a Discord account; there is "
+            "nobody to DM. Use `hotline-registry call` if they gave a SIP address."
+        )
     if not person.messageable:
         raise ContactError(
             f"{person.name} is in the registry but consent is withdrawn; not messaging them"
@@ -205,7 +257,10 @@ def send_message(person: Person, text: str, registry: Any = None) -> str:
     channel_id = str(channel.get("id", ""))
     if not channel_id:
         raise ContactError(f"Discord did not open a DM channel with {person.name}")
-    sent = _discord("POST", f"/channels/{channel_id}/messages", {"content": text[:1900]})
+    sent = _discord("POST", f"/channels/{channel_id}/messages",
+                    {"content": compose_message(person, text)})
+    if registry is not None and introduction(person):
+        registry.mark_introduced(person.discord_id)
     return str(sent.get("id", ""))
 
 
@@ -284,7 +339,7 @@ def call_person(
     try:
         outcome = client.place_call(
             reason,
-            context=context,
+            context=call_context(person, context),
             source=source,
             timeout=timeout,
             ring_timeout=ring_timeout,
@@ -300,6 +355,9 @@ def call_person(
         ) from exc
     except Exception as exc:  # the client raises DaemonError/CallTimeout
         raise ContactError(f"hotline-calld could not place the call: {exc}") from exc
+    # Only a call somebody picked up counts as having told them.
+    if registry is not None and outcome.state == "answered" and introduction(person):
+        registry.mark_introduced(person.discord_id)
     return CallResult(
         state=outcome.state, reply=outcome.reply, transcript=outcome.transcript,
         transport=outcome.transport, fake=outcome.fake, detail=outcome.detail,

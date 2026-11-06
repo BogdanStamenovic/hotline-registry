@@ -33,10 +33,12 @@ from .contact import (
     ContactError,
     call_health,
     call_person,
+    compose_message,
+    introduction,
     reconcile,
     send_message,
 )
-from .registry import Person, Registry, RegistryError
+from .registry import DEFAULT_STORE, Person, Registry, RegistryError
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -121,13 +123,74 @@ def _build_parser() -> argparse.ArgumentParser:
     revoke = sub.add_parser(
         "revoke", help="mark somebody uncontactable (they left, or asked not to be contacted)")
     revoke.add_argument("who")
+    revoke.add_argument("--reason", default="", help="kept on the row and shown by `show`")
     revoke.add_argument("--dry-run", action="store_true")
+    revoke.add_argument("--no-publish", action="store_true",
+                        help="do not refresh the admin channel afterwards")
+
+    # add/edit write the consent record by hand. Nothing in code gates them --
+    # an agent's shell is the same uid as his terminal -- so the rule lives in
+    # CLAUDE.md: adding somebody is Bogdan's call, not an agent's.
+    add = sub.add_parser("add", help="add a person by hand (Bogdan's call; see README)")
+    add.add_argument("name")
+    add.add_argument("--consent", required=True, metavar="TEXT",
+                     help="how they agreed to be contacted -- the row's only consent record")
+    add.add_argument("--discord", default="", metavar="ID", help="Discord user id or <@mention>")
+    add.add_argument("--discord-name", default="", metavar="NAME", help="their Discord username")
+    add.add_argument("--sip", default="", help="Linphone SIP address; blank means never call")
+    add.add_argument("--can-do", default="", metavar="TEXT", help="what they can help with")
+    add.add_argument("--guild", default="", metavar="ID",
+                     help="server they are a member of; leaving it then revokes them")
+    add.add_argument("--dry-run", action="store_true")
+    add.add_argument("--no-publish", action="store_true")
+
+    edit = sub.add_parser("edit", help="change somebody's fields; omitted options are kept")
+    edit.add_argument("who")
+    edit.add_argument("--name")
+    edit.add_argument("--discord", metavar="ID", help="attach or change a Discord id (re-keys)")
+    edit.add_argument("--discord-name", metavar="NAME")
+    edit.add_argument("--sip", help="'' clears it, which means: never call")
+    edit.add_argument("--can-do", metavar="TEXT")
+    edit.add_argument("--consent", metavar="TEXT")
+    edit.add_argument("--guild", metavar="ID")
+    edit.add_argument("--dry-run", action="store_true")
+    edit.add_argument("--no-publish", action="store_true")
     return parser
 
 
+def _cli_actor() -> str:
+    import getpass
+
+    try:
+        return f"cli:{getpass.getuser()}"
+    except Exception:  # noqa: BLE001 - provenance is best effort, the write is not
+        return "cli"
+
+
+def _republish(registry: Registry, skip: bool, log) -> None:
+    """Refresh the admin channel after a hand edit, but only for the real store.
+
+    A `--store` scratch copy republished would post test people over the real
+    roster in his private channel -- the 2026-09-20 incident, by another route.
+    """
+    if skip:
+        return
+    if registry.path.resolve() != DEFAULT_STORE.resolve():
+        log(f"not refreshing the admin channel: {registry.path} is not the live store")
+        return
+    try:
+        posted = publish(registry)
+    except Exception as exc:  # noqa: BLE001 - the write already happened; say so, do not undo
+        log(f"saved, but the admin channel was not refreshed: {exc}")
+        return
+    if not posted:
+        log("saved, but the admin channel was not refreshed (run `hotline-registry publish`)")
+
+
 def _row(person: Person) -> str:
-    return (f"{person.name:<20} {person.discord_name:<22} "
-            f"{(person.sip or '-'):<34} {person.channels():<16} {person.capabilities}")
+    return (f"{person.name:<20} {(person.discord_name or '-'):<22} "
+            f"{(person.sip or '-'):<34} {person.channels():<16} {person.source:<6} "
+            f"{person.capabilities}")
 
 
 def _as_dict(person: Person) -> dict:
@@ -135,8 +198,11 @@ def _as_dict(person: Person) -> dict:
         "discord_id": person.discord_id, "discord_name": person.discord_name,
         "name": person.name, "sip": person.sip, "capabilities": person.capabilities,
         "registered_at": person.registered_at, "updated_at": person.updated_at,
-        "revoked": person.revoked, "messageable": person.messageable,
-        "callable": person.callable_,
+        "revoked": person.revoked, "revoked_reason": person.revoked_reason,
+        "messageable": person.messageable, "callable": person.callable_,
+        "source": person.source, "added_by": person.added_by,
+        "added_via": person.added_via, "consent_note": person.consent_note,
+        "edited_by": person.edited_by, "introduced_at": person.introduced_at,
     }
 
 
@@ -147,7 +213,7 @@ def _print_roster(people: list[Person], as_json: bool) -> None:
     if not people:
         print("(nobody has filled in the registry form yet)")
         return
-    header = f"{'NAME':<20} {'DISCORD':<22} {'SIP':<34} {'CHANNELS':<16} CAN DO"
+    header = f"{'NAME':<20} {'DISCORD':<22} {'SIP':<34} {'CHANNELS':<16} {'SOURCE':<6} CAN DO"
     print(header)
     print("-" * len(header))
     for person in people:
@@ -219,14 +285,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(_as_dict(person), indent=2))
                 return EXIT_OK
             print(f"name          {person.name}")
-            print(f"discord       {person.discord_name} ({person.discord_id})")
+            if person.has_discord:
+                print(f"discord       {person.discord_name or '?'} ({person.discord_id})")
+            else:
+                print(f"discord       (none; key {person.discord_id})")
             print(f"sip           {person.sip or '(none given)'}")
             print(f"can do        {person.capabilities or '(not said)'}")
             print(f"registered    {person.registered_at}")
             print(f"updated       {person.updated_at}")
             print(f"you may       {person.channels()}")
+            if person.admin_added:
+                print(f"source        added by hand by {person.added_by or '?'}"
+                      f" via {person.added_via or '?'}")
+                print(f"consent       {person.consent_note or '(no note)'}")
+                print(f"introduced    {person.introduced_at or 'not yet -- the next contact says how they got here'}")
+            else:
+                print("source        self-registered through the form")
+            if person.edited_by:
+                print(f"edited by     {person.edited_by}")
             if person.revoked:
-                print("NOTE          consent withdrawn; do not contact")
+                why = f" ({person.revoked_reason})" if person.revoked_reason else ""
+                print(f"NOTE          consent withdrawn{why}; do not contact")
             return EXIT_OK
 
         if args.command == "status":
@@ -272,8 +351,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.dry_run:
                 print(f"would revoke {person.name} ({person.discord_id})")
                 return EXIT_OK
-            registry.revoke(person.discord_id)
+            registry.revoke(person.discord_id, args.reason)
             log(f"{person.name} is no longer contactable")
+            _republish(registry, args.no_publish, log)
+            return EXIT_OK
+
+        if args.command == "add":
+            if args.dry_run:
+                print(f"would add {args.name} (source admin): discord {args.discord or '-'}, "
+                      f"sip {args.sip or '-'}, consent: {args.consent}")
+                return EXIT_OK
+            person = registry.add_admin(
+                args.name, consent_note=args.consent, added_by=_cli_actor(), added_via="cli",
+                discord_id=args.discord, discord_name=args.discord_name, sip=args.sip,
+                capabilities=args.can_do, guild_id=args.guild,
+            )
+            log(f"added {person.name}; may {person.channels()}")
+            print(person.discord_id)
+            _republish(registry, args.no_publish, log)
+            return EXIT_OK
+
+        if args.command == "edit":
+            person = registry.resolve(args.who)
+            fields = {"name": args.name, "discord_name": args.discord_name, "sip": args.sip,
+                      "capabilities": args.can_do, "consent_note": args.consent,
+                      "guild_id": args.guild}
+            changes = {k: v for k, v in fields.items() if v is not None}
+            if args.discord is not None:
+                changes["discord_id"] = args.discord
+            if not changes:
+                print("hotline-registry: error: nothing to change", file=sys.stderr)
+                return EXIT_USAGE
+            if args.dry_run:
+                print(f"would change {person.name} ({person.discord_id}): "
+                      + ", ".join(f"{k}={v!r}" for k, v in changes.items()))
+                return EXIT_OK
+            discord_id = changes.pop("discord_id", None)
+            person = registry.edit(person.discord_id, edited_by=_cli_actor(),
+                                   discord_id=discord_id, **changes)
+            log(f"updated {person.name}; may {person.channels()}")
+            _republish(registry, args.no_publish, log)
             return EXIT_OK
 
         if args.command == "message":
@@ -284,11 +401,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return EXIT_USAGE
             if args.dry_run:
                 print(f"would DM {person.name} ({person.discord_name}, {person.discord_id}):")
-                print(text)
+                print(compose_message(person, text))
                 return EXIT_OK
             vlog(f"opening a DM channel with {person.discord_id}")
+            introducing = bool(introduction(person))
             message_id = send_message(person, text, registry)
             log(f"sent to {person.name}")
+            if introducing:
+                log("they were told Bogdan added them by hand and may reply STOP; nothing "
+                    "reads replies for you -- check the DM, and on STOP run "
+                    f"`hotline-registry revoke {person.discord_id} --reason 'replied STOP'`")
             print(message_id)
             return EXIT_OK
 
@@ -306,6 +428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"  as       {args.source}")
                 print(f"  reason   {reason}")
                 print(f"  context  {args.context or '(none)'}")
+                if introduction(person):
+                    print("  plus     the first-contact line: Bogdan added them by hand, how to opt out")
                 return EXIT_OK
             # Narrated only once it is actually going to happen. The refusals
             # live in `call_person`, where they cannot be skipped -- but printing
