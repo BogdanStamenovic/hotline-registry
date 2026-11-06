@@ -34,9 +34,10 @@ from .contact import (
     call_health,
     call_person,
     compose_message,
+    deliver_message,
     introduction,
     reconcile,
-    send_message,
+    whatsapp_status,
 )
 from .registry import DEFAULT_STORE, Person, Registry, RegistryError
 
@@ -86,6 +87,8 @@ def _build_parser() -> argparse.ArgumentParser:
     msg.add_argument("who")
     msg.add_argument("text", nargs="*", help="the message; '-' reads stdin")
     msg.add_argument("--dry-run", action="store_true", help="print what would be sent, send nothing")
+    msg.add_argument("--via", choices=["discord", "whatsapp"], default=None,
+                     help="this channel only (default: theirs, in their order, falling through)")
 
     call = sub.add_parser("call", help="ring somebody's Linphone and wait for their answer")
     call.add_argument("who")
@@ -99,6 +102,8 @@ def _build_parser() -> argparse.ArgumentParser:
     call.add_argument("--no-wait", action="store_true", help="ring and exit without waiting")
     call.add_argument("--dry-run", action="store_true",
                       help="print who would be rung at which address, ring nothing")
+    call.add_argument("--via", choices=["sip", "whatsapp"], default=None,
+                      help="this channel only (default: theirs, in their order, falling through)")
 
     sub.add_parser("status", help="whether messaging and calling actually work right now")
     pub = sub.add_parser(
@@ -139,6 +144,12 @@ def _build_parser() -> argparse.ArgumentParser:
     add.add_argument("--discord-name", default="", metavar="NAME", help="their Discord username")
     add.add_argument("--sip", default="", help="Linphone SIP address; blank means never call")
     add.add_argument("--can-do", default="", metavar="TEXT", help="what they can help with")
+    add.add_argument("--whatsapp", default="", metavar="E164",
+                     help="WhatsApp number, +countrycode...; blank means not on WhatsApp")
+    add.add_argument("--message-via", default="", metavar="LIST",
+                     help="message channels in order, e.g. whatsapp,discord ('' = Discord first)")
+    add.add_argument("--call-via", default="", metavar="LIST",
+                     help="call channels in order, e.g. whatsapp,sip ('' = SIP first)")
     add.add_argument("--guild", default="", metavar="ID",
                      help="server they are a member of; leaving it then revokes them")
     add.add_argument("--dry-run", action="store_true")
@@ -152,6 +163,12 @@ def _build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--sip", help="'' clears it, which means: never call")
     edit.add_argument("--can-do", metavar="TEXT")
     edit.add_argument("--consent", metavar="TEXT")
+    edit.add_argument("--whatsapp", metavar="E164",
+                     help="WhatsApp number, +countrycode...; '' clears it, which means not on WhatsApp")
+    edit.add_argument("--message-via", metavar="LIST",
+                     help="message channels in order, e.g. whatsapp,discord ('' = Discord first)")
+    edit.add_argument("--call-via", metavar="LIST",
+                     help="call channels in order, e.g. whatsapp,sip ('' = SIP first)")
     edit.add_argument("--guild", metavar="ID")
     edit.add_argument("--dry-run", action="store_true")
     edit.add_argument("--no-publish", action="store_true")
@@ -189,8 +206,8 @@ def _republish(registry: Registry, skip: bool, log) -> None:
 
 def _row(person: Person) -> str:
     return (f"{person.name:<20} {(person.discord_name or '-'):<22} "
-            f"{(person.sip or '-'):<34} {person.channels():<16} {person.source:<6} "
-            f"{person.capabilities}")
+            f"{(person.sip or '-'):<34} {(person.whatsapp or '-'):<16} {person.channels():<16} "
+            f"{person.source:<6} {person.capabilities}")
 
 
 def _as_dict(person: Person) -> dict:
@@ -203,6 +220,8 @@ def _as_dict(person: Person) -> dict:
         "source": person.source, "added_by": person.added_by,
         "added_via": person.added_via, "consent_note": person.consent_note,
         "edited_by": person.edited_by, "introduced_at": person.introduced_at,
+        "whatsapp": person.whatsapp, "message_via": person.message_routes(),
+        "call_via": person.call_routes(),
     }
 
 
@@ -213,7 +232,8 @@ def _print_roster(people: list[Person], as_json: bool) -> None:
     if not people:
         print("(nobody has filled in the registry form yet)")
         return
-    header = f"{'NAME':<20} {'DISCORD':<22} {'SIP':<34} {'CHANNELS':<16} {'SOURCE':<6} CAN DO"
+    header = (f"{'NAME':<20} {'DISCORD':<22} {'SIP':<34} {'WHATSAPP':<16} {'CHANNELS':<16} "
+              f"{'SOURCE':<6} CAN DO")
     print(header)
     print("-" * len(header))
     for person in people:
@@ -290,6 +310,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"discord       (none; key {person.discord_id})")
             print(f"sip           {person.sip or '(none given)'}")
+            print(f"whatsapp      {person.whatsapp or '(none given)'}")
+            if person.whatsapp or person.message_via or person.call_via:
+                print(f"messages via  {' > '.join(person.message_routes()) or '-'}"
+                      + ("" if person.message_via else "  (default order)"))
+                print(f"calls via     {' > '.join(person.call_routes()) or '-'}"
+                      + ("" if person.call_via else "  (default order)"))
             print(f"can do        {person.capabilities or '(not said)'}")
             print(f"registered    {person.registered_at}")
             print(f"updated       {person.updated_at}")
@@ -327,6 +353,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("messaging     yes (hotline's bot token found)")
             except ContactError as exc:
                 print(f"messaging     no -- {exc}")
+            on_wa = [p for p in people if p.whatsapp]
+            if on_wa or args.verbose:
+                wa = whatsapp_status()
+                print(f"whatsapp      {'yes' if wa['ok'] else 'no -- ' + wa['error']} "
+                      f"(messages via wa; {len(on_wa)} on WhatsApp)")
+                calls = health.get("whatsapp") if health.get("ok") else None
+                if calls is not None:
+                    print("whatsapp call " + ("yes" if calls.get("logged_in") else
+                                              f"no -- {calls.get('error', 'not linked')}; "
+                                              "WhatsApp-first calls ring SIP instead"))
             return EXIT_OK
 
         if args.command == "reconcile":
@@ -364,7 +400,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             person = registry.add_admin(
                 args.name, consent_note=args.consent, added_by=_cli_actor(), added_via="cli",
                 discord_id=args.discord, discord_name=args.discord_name, sip=args.sip,
-                capabilities=args.can_do, guild_id=args.guild,
+                capabilities=args.can_do, guild_id=args.guild, whatsapp=args.whatsapp,
+                message_via=args.message_via, call_via=args.call_via,
             )
             log(f"added {person.name}; may {person.channels()}")
             print(person.discord_id)
@@ -375,7 +412,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             person = registry.resolve(args.who)
             fields = {"name": args.name, "discord_name": args.discord_name, "sip": args.sip,
                       "capabilities": args.can_do, "consent_note": args.consent,
-                      "guild_id": args.guild}
+                      "guild_id": args.guild, "whatsapp": args.whatsapp,
+                      "message_via": args.message_via, "call_via": args.call_via}
             changes = {k: v for k, v in fields.items() if v is not None}
             if args.discord is not None:
                 changes["discord_id"] = args.discord
@@ -399,14 +437,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not text:
                 print("hotline-registry: error: nothing to send", file=sys.stderr)
                 return EXIT_USAGE
+            routes = [args.via] if args.via else person.message_routes()
             if args.dry_run:
-                print(f"would DM {person.name} ({person.discord_name}, {person.discord_id}):")
+                where = {"discord": f"Discord ({person.discord_name}, {person.discord_id})",
+                         "whatsapp": f"WhatsApp ({person.whatsapp})"}
+                if not routes or person.revoked:
+                    print(f"would NOT message {person.name}: {person.channels()}")
+                    return EXIT_OK
+                print(f"would DM {person.name} on {where.get(routes[0], routes[0])}"
+                      + (f", then {', '.join(routes[1:])} if that fails" if len(routes) > 1 else "")
+                      + ":")
                 print(compose_message(person, text))
                 return EXIT_OK
-            vlog(f"opening a DM channel with {person.discord_id}")
+            vlog(f"trying {', '.join(routes) or 'nothing'} for {person.name}")
             introducing = bool(introduction(person))
-            message_id = send_message(person, text, registry)
-            log(f"sent to {person.name}")
+            via, message_id = deliver_message(person, text, registry, via=args.via)
+            log(f"sent to {person.name} via {via}")
             if introducing:
                 log("they were told Bogdan added them by hand and may reply STOP; nothing "
                     "reads replies for you -- check the DM, and on STOP run "
@@ -424,7 +470,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not person.callable_:
                     print(f"would NOT call {person.name}: {person.channels()}")
                     return EXIT_OK
-                print(f"would ring {person.name} at {person.sip}")
+                routes = [args.via] if args.via else person.call_routes()
+                where = {"sip": person.sip, "whatsapp": f"WhatsApp {person.whatsapp}"}
+                print(f"would ring {person.name} at " + ", then ".join(
+                    where[r] for r in routes if r in where))
                 print(f"  as       {args.source}")
                 print(f"  reason   {reason}")
                 print(f"  context  {args.context or '(none)'}")
@@ -435,18 +484,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             # live in `call_person`, where they cannot be skipped -- but printing
             # "ringing Bogdan at " and then refusing describes a call that never
             # was, which is the one thing narration must never do.
-            if person.callable_:
-                log(f"ringing {person.name} at {person.sip}")
+            if person.callable_ and (args.via is None or args.via in person.call_routes()):
+                first = (args.via or person.call_routes()[0])
+                log(f"ringing {person.name} at "
+                    + (person.sip if first == "sip" else f"WhatsApp {person.whatsapp}"))
             result: CallResult = call_person(
                 person, reason, context=args.context, source=args.source,
                 timeout=args.timeout, ring_timeout=args.ring_timeout, wait=not args.no_wait,
-                registry=registry,
+                registry=registry, via=args.via,
             )
             if result.fake:
                 print("hotline-registry: error: the doorbell is fake -- nothing rang",
                       file=sys.stderr)
                 return EXIT_FAILED
-            log(f"{result.state} via {result.transport} after {result.waited_seconds:.0f}s")
+            log(f"{result.state} via {result.via or result.transport} after {result.waited_seconds:.0f}s")
             if result.state == "declined":
                 log(f"{person.name} declined the call")
                 return EXIT_DECLINED

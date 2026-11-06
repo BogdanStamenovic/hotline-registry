@@ -24,7 +24,8 @@ how they got on the list and how to get off it (see below).
 
 ```
 person joins "Claude contacts"  ->  presses the button in #registry
-                                ->  fills in a modal: name, Linphone SIP, what they can do
+                                ->  fills in a modal: name, Linphone SIP, what they can do,
+                                    WhatsApp number, which channel first
                                 ->  row written to the registry, "registered" role granted
                                 ->  an agent may now DM them, and ring them if they gave a SIP
 person leaves the server        ->  consent revoked, immediately
@@ -80,10 +81,36 @@ Two channels, two separate permissions, because they are not the same promise:
 |---|---|---|---|
 | Discord DM | hotline's bot shares a guild with them, so it can DM them — REST only, no gateway | submitting the form | leaving the server, or `revoke` |
 | Phone call | `hotline-iosd` registers one Linphone account and INVITEs theirs — SIP to SIP, free | typing a Linphone address into the form | clearing that field, or leaving |
+| WhatsApp message and call | messages through `wa send text` (ownbox `wa`, upstream wacli); calls through hotline-calld, which drives wa-call | typing a WhatsApp number into the form | clearing that field, or leaving |
 
 **Leaving the SIP field blank is a complete answer.** It means "message me, do
 not ring me", and `call` refuses with that reason rather than treating it as a
-missing value.
+missing value. A blank WhatsApp field means "not on WhatsApp" in the same way.
+
+### Which channel, in which order
+
+Bogdan, 2026-11-06: *"if message backend is discord use discord ... if its
+whatsapp use whatsapp. for messages and or calls."* Each person has two
+ordered lists, `message_via` and `call_via`, filled from one form answer
+("Reach me first on: whatsapp, linphone").
+
+| | default (blank) | with a preference |
+|---|---|---|
+| `message` | Discord, then WhatsApp if they gave a number | their order, over the channels they gave |
+| `call` | SIP, then WhatsApp if they gave a number | their order, over the channels they gave |
+
+`message` tries each channel in turn and falls through when one fails, for
+example when Discord refuses a DM. One exception: someone who has left the server
+has withdrawn consent everywhere. So the membership check runs once, first, and
+stops every channel. `call` sends hotline-calld both addresses and the order, and
+hotline-calld falls through to the next channel when WhatsApp is unlinked or
+down. `--via` on either forces one channel. WhatsApp messages go to
+`<digits>@s.whatsapp.net` rather than the bare number, because wacli's `--to`
+also matches contact names.
+
+**On WhatsApp the message and the call come from whichever account `wa` and
+wa-call are linked to.** If that is his own account, people see Bogdan. See
+Limitations.
 
 Nothing in this repository implements Discord, SIP, speech recognition or
 text-to-speech. Messaging is two REST calls with
@@ -155,7 +182,9 @@ Then, in `hotlined`, load the cog (`hotline` does this already if
 | `--no-publish` | on `revoke`, `add` and `edit`: do not refresh the admin channel afterwards |
 | `--json` | on `list`, `find` and `show`: machine-readable, for an agent |
 | `--all` | on `list`: include people who have withdrawn consent |
-| `--callable` | on `list`: only people who gave a SIP address |
+| `--callable` | on `list`: only people who can be called (SIP or WhatsApp) |
+| `--via` | on `message` (`discord`/`whatsapp`) and `call` (`sip`/`whatsapp`): that channel only |
+| `--whatsapp`, `--message-via`, `--call-via` | on `add` and `edit`: the number (E.164) and the two orders |
 | `--context` | on `call`: everything the voice on the line should know — it knows nothing else |
 | `--no-wait` | on `call`: ring and exit rather than waiting for an answer |
 
@@ -244,6 +273,20 @@ hotline-registry devices claim pigion wake-server "wake server" --unit wake-serv
 
 - **Calling a real phone number.** SIP-to-SIP is free; reaching the PSTN needs a
   paid trunk. That is money, so it is Bogdan's decision and is not built.
+  WhatsApp calls are free, but only reach WhatsApp users.
+- **WhatsApp is built and untested against WhatsApp.** No account is linked on
+  archserver yet. Messaging and call routing are tested against a fake `wa` and a
+  fake call client, and `status` reports both halves as unlinked.
+- **WhatsApp traffic is sent as the linked account.** Upstream wacli and wa-call
+  are unofficial clients (see the `wa` README for ban risk). If the linked
+  number is his personal one, every WhatsApp message and call shows him as the
+  sender.
+- **Hand-added people get WhatsApp from the CLI only.** The admin modal already
+  has Discord's maximum of five fields, so `/registry add`/`edit` cannot hold a
+  number. Use `hotline-registry edit WHO --whatsapp +381... --call-via whatsapp`.
+- **The `#registry` channel message is not rewritten.** The form has the new
+  fields as soon as `hotlined` loads this version, but the explanatory message
+  posted in the channel still describes three fields until someone re-posts it.
 - **Gating the server is done with a role, not enforced by the bot.** An
   unregistered member sees only `#registry`, because `@everyone` is denied View
   Channel everywhere else and the `registered` role restores it. If Discord's

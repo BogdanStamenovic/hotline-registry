@@ -30,6 +30,18 @@ def _no_real_discord(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_whatsapp(tmp_path, monkeypatch):
+    """Nor WhatsApp, for the same reason: `wa send` on a linked box sends for real.
+
+    `HOTLINE_REGISTRY_WA` points at a stand-in that refuses; a test that wants a
+    working `wa` installs its own fake (see test_whatsapp.py)."""
+    refuse = tmp_path / "wa-refuses"
+    refuse.write_text("#!/bin/sh\necho 'a test tried to run the real wa' >&2\nexit 99\n")
+    refuse.chmod(0o755)
+    monkeypatch.setenv("HOTLINE_REGISTRY_WA", str(refuse))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_device_map(tmp_path, monkeypatch):
     """Nor the real device map: publish() appends it, and it holds real addresses."""
     monkeypatch.setenv("HOTLINE_REGISTRY_DEVICES", str(tmp_path / "devices.json"))

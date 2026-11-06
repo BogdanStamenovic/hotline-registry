@@ -1,4 +1,9 @@
-"""Reaching a person: a Discord DM, or a real phone call to their Linphone.
+"""Reaching a person: a message (Discord DM or WhatsApp), or a call (Linphone or WhatsApp).
+
+Each person's channels are tried in their own order (`Person.message_routes`,
+`Person.call_routes`), falling through when one fails. WhatsApp messages go
+through `wa send text` (upstream wacli); WhatsApp calls go through
+hotline-calld, which drives wa-call.
 
 Neither mechanism is implemented here. Both already exist and both are hard-won:
 
@@ -23,6 +28,8 @@ import importlib
 import json
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -233,35 +240,120 @@ def call_context(person: Person, context: str) -> str:
     return f"{line}\n\n{context}" if context else line
 
 
-def send_message(person: Person, text: str, registry: Any = None) -> str:
-    """DM them. Returns the message id.
+def send_message(person: Person, text: str, registry: Any = None, *,
+                 via: str | None = None) -> str:
+    """Message them on their preferred channel. Returns the message id.
 
-    Opening the DM channel is a separate call that Discord makes idempotent --
-    `POST /users/@me/channels` with a recipient already DM'd returns the existing
-    channel rather than a second one -- so there is nothing to cache and nothing
-    to go stale.
+    See `deliver_message`; this is it without saying which channel carried it.
     """
-    if not person.has_discord and not person.revoked:
-        raise ContactError(
-            f"{person.name} was added by hand without a Discord account; there is "
-            "nobody to DM. Use `hotline-registry call` if they gave a SIP address."
-        )
-    if not person.messageable:
+    return deliver_message(person, text, registry, via=via)[1]
+
+
+def deliver_message(person: Person, text: str, registry: Any = None, *,
+                    via: str | None = None) -> tuple[str, str]:
+    """Send on the first channel that works, in their order. Returns (channel, id).
+
+    Bogdan, 2026-11-06: "if message backend is discord use discord ... if its
+    whatsapp use whatsapp". `person.message_routes()` is their order (Discord
+    first unless they said otherwise), restricted to channels they gave; `via`
+    forces one. A channel that fails falls through to the next, with one
+    exception: having left the server withdraws consent for every channel, so
+    the membership check runs once, first, and stops everything.
+    """
+    if person.revoked:
         raise ContactError(
             f"{person.name} is in the registry but consent is withdrawn; not messaging them"
+        )
+    routes = person.message_routes()
+    if via:
+        if via not in routes:
+            raise ContactError(f"{person.name} cannot be messaged on {via} "
+                               f"(they can be on: {', '.join(routes) or 'nothing'})")
+        routes = [via]
+    if not routes:
+        raise ContactError(
+            f"{person.name} was added by hand without a Discord account or a WhatsApp "
+            "number; there is nobody to DM. Use `hotline-registry call` if they gave a SIP address."
         )
     if not text.strip():
         raise ContactError("refusing to send an empty message")
     check_membership(person, registry)
+    body = compose_message(person, text)
+    failures: list[str] = []
+    for route in routes:
+        try:
+            sent = _send_discord(person, body) if route == "discord" else _send_whatsapp(person, body)
+        except ContactError as exc:
+            failures.append(f"{route}: {exc}")
+            continue
+        if registry is not None and introduction(person):
+            registry.mark_introduced(person.discord_id)
+        return route, sent
+    raise ContactError(f"could not message {person.name} -- " + "; ".join(failures))
+
+
+def _send_discord(person: Person, body: str) -> str:
+    """Opening the DM channel is idempotent on Discord's side -- `POST
+    /users/@me/channels` with a recipient already DM'd returns the existing
+    channel -- so there is nothing to cache and nothing to go stale."""
     channel = _discord("POST", "/users/@me/channels", {"recipient_id": person.discord_id})
     channel_id = str(channel.get("id", ""))
     if not channel_id:
         raise ContactError(f"Discord did not open a DM channel with {person.name}")
-    sent = _discord("POST", f"/channels/{channel_id}/messages",
-                    {"content": compose_message(person, text)})
-    if registry is not None and introduction(person):
-        registry.mark_introduced(person.discord_id)
+    sent = _discord("POST", f"/channels/{channel_id}/messages", {"content": body})
     return str(sent.get("id", ""))
+
+
+def wa_command() -> list[str]:
+    """`wa` (ownbox's WhatsApp tool), wherever it is: HOTLINE_REGISTRY_WA, PATH, ~/.local/bin."""
+    chosen = os.environ.get("HOTLINE_REGISTRY_WA", "")
+    if chosen:
+        return [chosen]
+    found = shutil.which("wa") or str(pathlib.Path.home() / ".local/bin/wa")
+    return [found]
+
+
+def _send_whatsapp(person: Person, body: str) -> str:
+    """`wa send text`, which is upstream wacli on the linked account.
+
+    The recipient is given as a JID, not the bare number: wacli's `--to` also
+    matches contact and chat *names*, and a message meant for one person must
+    not be resolved by a fuzzy match.
+    """
+    jid = person.whatsapp.lstrip("+") + "@s.whatsapp.net"
+    command = [*wa_command(), "send", "text", "--to", jid, "--message", body, "--json"]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    except FileNotFoundError as exc:
+        raise ContactError("the `wa` command is not installed (ownbox install wa)") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ContactError("wa send timed out after 120 s") from exc
+    try:
+        envelope = json.loads(done.stdout.strip().splitlines()[-1]) if done.stdout.strip() else {}
+    except ValueError:
+        envelope = {}
+    if envelope.get("success") is True:
+        data = envelope.get("data") or {}
+        return str(data.get("id", ""))
+    why = envelope.get("error") or done.stderr.strip()[-300:] or f"exit {done.returncode}"
+    raise ContactError(f"WhatsApp refused: {why}")
+
+
+def whatsapp_status() -> dict[str, Any]:
+    """Whether `wa` is installed and linked, for `status`. Never raises."""
+    try:
+        done = subprocess.run([*wa_command(), "auth", "status", "--json"],
+                              capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        envelope = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"ok": False, "error": (done.stderr or done.stdout).strip()[-200:] or "no answer"}
+    data = envelope.get("data") or {}
+    authed = bool(data.get("authenticated", data.get("logged_in", False)))
+    return {"ok": envelope.get("success") is True and authed,
+            "error": "" if authed else (envelope.get("error") or "not linked (`wa link`)")}
 
 
 def _ios_client() -> Any:
@@ -304,6 +396,7 @@ class CallResult:
     fake: bool = False
     detail: str = ""
     waited_seconds: float = 0.0
+    via: str = ""
 
     @property
     def rang(self) -> bool:
@@ -320,22 +413,40 @@ def call_person(
     ring_timeout: float = 45.0,
     wait: bool = True,
     registry: Any = None,
+    via: str | None = None,
 ) -> CallResult:
-    """Ring their Linphone and, unless `wait` is false, come back with what they said.
+    """Ring them and, unless `wait` is false, come back with what they said.
 
-    SIP-to-SIP only, and therefore free: `hotline-iosd` registers one Linphone
-    account and INVITEs another. Ringing an actual phone *number* would need a
-    paid PSTN trunk, which is money and therefore his decision, not this tool's.
+    Over their Linphone SIP address or their WhatsApp number, in their order
+    (`person.call_routes()`, SIP first unless they said otherwise); `via`
+    forces one. Both are free: SIP-to-SIP from our Linphone account, or a
+    WhatsApp call from the account wa-call is linked to. hotline-calld does the
+    ringing and the falling through -- WhatsApp unlinked or down rings SIP --
+    so this sends it both addresses and the order. Ringing an actual phone
+    *number* over the phone network would need a paid trunk: his decision, not
+    built.
     """
     if not person.callable_:
         if person.revoked:
             raise ContactError(f"{person.name} has withdrawn consent; not calling them")
         raise ContactError(
-            f"{person.name} left the SIP field blank, which means 'message me, do not "
-            "ring me'. Use `hotline-registry message` instead."
+            f"{person.name} left the SIP and WhatsApp fields blank, which means 'message "
+            "me, do not ring me'. Use `hotline-registry message` instead."
         )
+    routes = person.call_routes()
+    if via:
+        if via not in routes:
+            raise ContactError(f"{person.name} cannot be called on {via} "
+                               f"(they can be on: {', '.join(routes)})")
+        routes = [via]
     check_membership(person, registry)
     client = _ios_client()
+    addressing: dict[str, Any] = {"to": person.sip if "sip" in routes else ""}
+    if "whatsapp" in routes:
+        # Only when WhatsApp is in play, so a SIP-only call is the exact request
+        # an older hotline-call client accepts.
+        addressing.update(whatsapp=person.whatsapp, via="auto" if len(routes) > 1 else routes[0],
+                          via_order=routes)
     try:
         outcome = client.place_call(
             reason,
@@ -344,14 +455,16 @@ def call_person(
             timeout=timeout,
             ring_timeout=ring_timeout,
             wait=wait,
-            transport="sip",
-            to=person.sip,
+            transport="sip" if routes == ["sip"] else "auto",
             callee=person.name,
+            **addressing,
         )
     except TypeError as exc:
         raise ContactError(
-            "this hotline-ios does not accept a `to` address yet -- it predates the "
-            f"registry's SIP generalisation ({exc})"
+            "this hotline-call client does not accept "
+            + ("a WhatsApp number yet; update hotline-call" if "whatsapp" in routes
+               else "a `to` address yet -- it predates the registry's SIP generalisation")
+            + f" ({exc})"
         ) from exc
     except Exception as exc:  # the client raises DaemonError/CallTimeout
         raise ContactError(f"hotline-calld could not place the call: {exc}") from exc
@@ -361,7 +474,7 @@ def call_person(
     return CallResult(
         state=outcome.state, reply=outcome.reply, transcript=outcome.transcript,
         transport=outcome.transport, fake=outcome.fake, detail=outcome.detail,
-        waited_seconds=outcome.waited_seconds,
+        waited_seconds=outcome.waited_seconds, via=str(getattr(outcome, "via", "") or ""),
     )
 
 

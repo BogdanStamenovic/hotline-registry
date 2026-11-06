@@ -22,6 +22,7 @@ Two channels, two separate permissions, because they are not the same promise:
 |---|---|---|
 | Discord DM | joining the server and submitting the form | leaving the server, or `revoked` |
 | Phone (SIP) | typing a Linphone address into the form | clearing that field, or leaving |
+| WhatsApp (message and call) | typing a WhatsApp number into the form | clearing that field, or leaving |
 
 Leaving the SIP field empty is a complete answer -- it means "message me, do not
 ring me" -- so an empty `sip` is never an error, only a `callable` of False.
@@ -74,6 +75,40 @@ def normalise_sip(raw: str) -> str:
     return f"sip:{raw}"
 
 
+def normalise_whatsapp(raw: str) -> str:
+    """E.164 (`+381600000000`) out of what someone typed, or "" if it is not a number.
+
+    Blank means "not on WhatsApp", the same complete answer a blank SIP field
+    is. Spaces, dashes, brackets and a leading 00 are what people type; a bare
+    national number with no country code cannot be told apart from a foreign
+    one, so it is not guessed at.
+    """
+    digits = re.sub(r"[\s().\-]", "", (raw or "").strip())
+    if digits.startswith("00"):
+        digits = "+" + digits[2:]
+    return digits if re.fullmatch(r"\+[1-9]\d{6,14}", digits) else ""
+
+
+MESSAGE_CHANNELS = ("discord", "whatsapp")
+CALL_CHANNELS = ("sip", "whatsapp")
+_ALIASES = {"linphone": "sip", "phone": "sip", "wa": "whatsapp", "dm": "discord"}
+
+
+def parse_via(raw: str, allowed: tuple[str, ...]) -> str:
+    """An ordered channel preference, as a comma list of known names ("" = default).
+
+    `"WhatsApp, linphone"` -> `"whatsapp"` for messages, `"whatsapp,sip"` for
+    calls: each list keeps only the channels that kind of contact can use, so
+    one answer in the form fills both.
+    """
+    seen: list[str] = []
+    for word in re.split(r"[\s,;/>]+", (raw or "").lower()):
+        word = _ALIASES.get(word, word)
+        if word in allowed and word not in seen:
+            seen.append(word)
+    return ",".join(seen)
+
+
 SOURCE_FORM = "form"
 SOURCE_ADMIN = "admin"
 NO_DISCORD_PREFIX = "admin-"
@@ -100,6 +135,12 @@ def parse_discord_id(raw: str) -> str:
             "the person, Copy User ID (needs Developer Mode)."
         )
     return match.group(1) or match.group(2)
+
+
+def _routes(preferred: str, default: tuple[str, ...], have: dict[str, bool]) -> list[str]:
+    order = [v for v in preferred.split(",") if v in default]
+    order += [v for v in default if v not in order]
+    return [v for v in order if have.get(v)]
 
 
 @dataclass
@@ -140,6 +181,12 @@ class Person:
     introduced_at: str = ""
     """When an agent first reached an `admin` row and said how they got here.
     Empty means the next contact must carry that line."""
+    whatsapp: str = ""
+    """E.164, or "" for "not on WhatsApp" -- a complete answer, like a blank SIP."""
+    message_via: str = ""
+    """Ordered message channels ("whatsapp,discord"); "" is the default, Discord first."""
+    call_via: str = ""
+    """Ordered call channels ("whatsapp,sip"); "" is the default, SIP first."""
 
     @property
     def admin_added(self) -> bool:
@@ -151,17 +198,31 @@ class Person:
 
     @property
     def messageable(self) -> bool:
-        return self.has_discord and not self.revoked
+        return bool(self.message_routes()) and not self.revoked
 
     @property
     def callable_(self) -> bool:
-        return bool(self.sip) and not self.revoked
+        return bool(self.call_routes()) and not self.revoked
+
+    def message_routes(self) -> list[str]:
+        """Message channels they can be reached on, in their order of preference."""
+        have = {"discord": self.has_discord, "whatsapp": bool(self.whatsapp)}
+        return _routes(self.message_via, MESSAGE_CHANNELS, have)
+
+    def call_routes(self) -> list[str]:
+        """Call channels they can be rung on, in their order of preference."""
+        have = {"sip": bool(self.sip), "whatsapp": bool(self.whatsapp)}
+        return _routes(self.call_via, CALL_CHANNELS, have)
 
     def channels(self) -> str:
         if self.revoked:
             return "none (revoked)"
-        ways = [w for w, ok in (("message", self.has_discord), ("call", bool(self.sip))) if ok]
-        return ", ".join(ways) or "none (no Discord, no SIP)"
+        if not self.whatsapp:
+            ways = [w for w, ok in (("message", self.has_discord), ("call", bool(self.sip))) if ok]
+            return ", ".join(ways) or "none (no Discord, no SIP)"
+        out = [f"{kind} ({' > '.join(routes)})" for kind, routes in
+               (("message", self.message_routes()), ("call", self.call_routes())) if routes]
+        return ", ".join(out)
 
     @classmethod
     def from_dict(cls, raw: dict) -> Person:
@@ -248,6 +309,9 @@ class Registry:
         sip: str = "",
         capabilities: str = "",
         guild_id: str = "",
+        whatsapp: str = "",
+        message_via: str = "",
+        call_via: str = "",
     ) -> Person:
         """Record somebody Bogdan added by hand.
 
@@ -268,6 +332,9 @@ class Registry:
             )
         discord_id = parse_discord_id(discord_id)
         sip = normalise_sip(sip)
+        number = normalise_whatsapp(whatsapp)
+        if whatsapp.strip() and not number:
+            raise RegistryError(f"{whatsapp!r} is not a WhatsApp number; use +countrycode...")
         if discord_id:
             existing = self.people.get(discord_id)
             if existing is not None and not existing.revoked:
@@ -289,12 +356,16 @@ class Registry:
             added_by=added_by,
             added_via=added_via,
             consent_note=consent_note,
+            whatsapp=number,
+            message_via=parse_via(message_via, MESSAGE_CHANNELS),
+            call_via=parse_via(call_via, CALL_CHANNELS),
         )
         self.people[key] = person
         self.save()
         return person
 
-    EDITABLE = ("name", "discord_name", "sip", "capabilities", "consent_note", "guild_id")
+    EDITABLE = ("name", "discord_name", "sip", "capabilities", "consent_note", "guild_id",
+                "whatsapp", "message_via", "call_via")
 
     def edit(self, key: str, *, edited_by: str, discord_id: str | None = None,
              **fields: str | None) -> Person:
@@ -330,6 +401,15 @@ class Registry:
             value = value.strip()
             if name == "sip":
                 value = normalise_sip(value)
+            if name == "whatsapp":
+                number = normalise_whatsapp(value)
+                if value and not number:
+                    raise RegistryError(f"{value!r} is not a WhatsApp number; use +countrycode...")
+                value = number
+            if name == "message_via":
+                value = parse_via(value, MESSAGE_CHANNELS)
+            if name == "call_via":
+                value = parse_via(value, CALL_CHANNELS)
             if name == "name" and not value:
                 raise RegistryError("the name cannot be blank")
             setattr(person, name, value)

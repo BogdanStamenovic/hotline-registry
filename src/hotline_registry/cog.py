@@ -41,7 +41,17 @@ import discord
 
 from .admin import CHANNEL_ENV, publish
 from .contact import load_env_file
-from .registry import Person, Registry, RegistryError, normalise_sip, parse_discord_id
+from .registry import (
+    CALL_CHANNELS,
+    MESSAGE_CHANNELS,
+    Person,
+    Registry,
+    RegistryError,
+    normalise_sip,
+    normalise_whatsapp,
+    parse_discord_id,
+    parse_via,
+)
 
 log = logging.getLogger("hotline-registry.cog")
 
@@ -54,20 +64,29 @@ WELCOME = (
     "Bogdan runs agents that do real work, and sometimes one of them needs a "
     "person -- a question answered, a review, a heads-up. This form is how an "
     "agent is *allowed* to reach you. Nobody is contacted who is not in here.\n\n"
-    "**Three fields:**\n"
+    "**Five fields:**\n"
     "- **Name** -- what you want to be called.\n"
     "- **Linphone SIP address** -- optional. Fill it in and an agent may ring "
     "your phone through Linphone; it is a free SIP-to-SIP call. **Leave it blank "
-    "and you will never be called**, only messaged. That is a complete answer.\n"
+    "and you will never be called** on Linphone. That is a complete answer.\n"
     "- **What you can do** -- in your own words. This is what an agent searches "
-    "when it is looking for somebody who knows about a thing.\n\n"
+    "when it is looking for somebody who knows about a thing.\n"
+    "- **WhatsApp number** -- optional, with the country code (+381...). Fill it in "
+    "and an agent may message you and call you on WhatsApp. Blank means never on WhatsApp.\n"
+    "- **Reach me first on** -- optional: `whatsapp`, `discord` or `linphone`, in the "
+    "order you prefer. Blank: Discord for messages, Linphone for calls.\n\n"
     "You can press the button again any time to change your answers. "
     "Leave the server and you stop being contactable, immediately and without asking."
 )
 
 
 class RegistryModal(discord.ui.Modal):
-    """The form itself. Three fields, exactly as he specified them."""
+    """The form itself: his three fields, plus WhatsApp and the order to use them in.
+
+    Five is Discord's limit for a modal, so this form is now full. The two
+    WhatsApp fields came with his request of 2026-11-06 (Discord
+    1568267763036856402): message and call people on the channel they prefer.
+    """
 
     def __init__(self, registry: Registry, existing: Person | None = None) -> None:
         super().__init__(title="Claude contacts — registry")
@@ -94,6 +113,20 @@ class RegistryModal(discord.ui.Modal):
             max_length=1000,
             required=True,
         ))
+        self.add_item(discord.ui.InputText(
+            label="WhatsApp number (optional)",
+            placeholder="+381 60 123 4567  — blank means: not on WhatsApp",
+            value=existing.whatsapp if existing else None,
+            max_length=24,
+            required=False,
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Reach me first on (optional)",
+            placeholder="e.g. whatsapp, discord, linphone — blank: Discord, then Linphone for calls",
+            value=_preference(existing) if existing else None,
+            max_length=60,
+            required=False,
+        ))
 
     async def callback(self, interaction: discord.Interaction) -> None:
         user = interaction.user
@@ -101,7 +134,11 @@ class RegistryModal(discord.ui.Modal):
             return
         name = (self.children[0].value or "").strip()
         sip = normalise_sip(self.children[1].value or "")
+        # Appended after his original three, so their positions never moved.
         capabilities = (self.children[2].value or "").strip()
+        typed_wa = (self.children[3].value or "").strip()
+        whatsapp = normalise_whatsapp(typed_wa)
+        prefer = (self.children[4].value or "").strip()
 
         person = Person(
             discord_id=str(user.id),
@@ -110,6 +147,9 @@ class RegistryModal(discord.ui.Modal):
             sip=sip,
             capabilities=capabilities,
             guild_id=str(interaction.guild_id or ""),
+            whatsapp=whatsapp,
+            message_via=parse_via(prefer, MESSAGE_CHANNELS),
+            call_via=parse_via(prefer, CALL_CHANNELS),
         )
         try:
             self.registry.upsert(person)
@@ -133,14 +173,35 @@ class RegistryModal(discord.ui.Modal):
 
         granted = await _grant_registered(interaction)
         how = "message you on Discord" + (" and ring your Linphone" if sip else "")
+        if whatsapp:
+            how += " and message and call you on WhatsApp"
+        notes = []
+        if not sip and not whatsapp:
+            notes.append("You left the SIP and WhatsApp fields blank, so nobody will call you.")
+        if typed_wa and not whatsapp:
+            notes.append(f"I could not read {typed_wa!r} as a WhatsApp number (it needs the "
+                         "country code, like +381...), so I left it out. Press the button "
+                         "again to fix it.")
+        if whatsapp or person.message_via or person.call_via:
+            notes.append("Messages go by " + " then ".join(person.message_routes())
+                         + (", calls by " + " then ".join(person.call_routes())
+                            if person.call_routes() else "") + ".")
         await interaction.response.send_message(
             f"Thanks {person.name} — you're in the registry.\n"
             f"An agent may now **{how}**."
-            + ("" if sip else "\n\nYou left the SIP field blank, so nobody will call you.")
+            + "".join(f"\n\n{n}" for n in notes)
             + ("" if granted else "\n\n(I could not give you the member role — Bogdan will sort it.)"),
             ephemeral=True,
         )
         log.info("registry: %s (%s) registered, callable=%s", person.name, user.id, bool(sip))
+
+
+def _preference(person: Person) -> str:
+    """The "reach me first on" answer, as they would have typed it."""
+    words = [("linphone" if v == "sip" else v)
+             for v in dict.fromkeys(person.message_via.split(",") + person.call_via.split(","))
+             if v]
+    return ", ".join(words)
 
 
 async def _grant_registered(interaction: discord.Interaction) -> bool:
