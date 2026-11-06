@@ -1,12 +1,20 @@
 """The registry itself: who consented to be contacted, and on which channels.
 
-**The store is not a contact list, it is a consent record.** Someone is in here
-because they joined the "Claude contacts" server and filled in the form, and
-that act -- theirs, not ours -- is the standing permission for an agent to reach
-them. Nothing else creates an entry. There is deliberately no `add` command, and
-`upsert` takes a Discord id it can only have got from an interaction the person
-performed, because a registry an agent can write into by hand is an address book
-with a consent-shaped label on it.
+**The store is not a contact list, it is a consent record.** An entry gets
+here one of two ways, and every row says which (`source`):
+
+- `form` -- they joined the "Claude contacts" server and filled in the form.
+  That act, theirs, is the standing permission for an agent to reach them.
+  `upsert` takes a Discord id it can only have got from an interaction the
+  person performed. Rows written before `source` existed have no such key and
+  read back as `form`, which is what they all were.
+- `admin` -- Bogdan added them by hand (2026-11-06: *"the ability for me to
+  edit the admin registry so i can add or unadd people"*). The consent is then
+  his claim about them, so the row carries who added it (`added_by`), where
+  (`added_via`) and his note on how they agreed (`consent_note`), and the first
+  agent to reach them says so (`introduced_at`). A row that hides that it was
+  typed in by somebody else is an address book with a consent-shaped label on
+  it; one that says so is an honest record of a second kind of consent.
 
 Two channels, two separate permissions, because they are not the same promise:
 
@@ -28,6 +36,8 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
+import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
@@ -64,10 +74,44 @@ def normalise_sip(raw: str) -> str:
     return f"sip:{raw}"
 
 
+SOURCE_FORM = "form"
+SOURCE_ADMIN = "admin"
+NO_DISCORD_PREFIX = "admin-"
+"""Key prefix for a hand-added person with no Discord account. `discord_id` is
+the registry's key, and somebody reachable only on Linphone still needs one;
+the prefix makes it impossible to mistake for a snowflake and DM it."""
+
+
+def parse_discord_id(raw: str) -> str:
+    """A Discord user id out of an id or a mention (`<@123>`, `<@!123>`).
+
+    Returns "" for blank input and raises on anything else -- a username is not
+    accepted because resolving one needs the privileged members intent, and a
+    guess at which "milos" was meant is exactly the mistake `resolve` refuses
+    to make.
+    """
+    raw = raw.strip()
+    if not raw:
+        return ""
+    match = re.fullmatch(r"<@!?(\d{15,22})>|(\d{15,22})", raw)
+    if not match:
+        raise RegistryError(
+            f"{raw!r} is not a Discord user id or mention. In Discord: right-click "
+            "the person, Copy User ID (needs Developer Mode)."
+        )
+    return match.group(1) or match.group(2)
+
+
 @dataclass
 class Person:
-    """One consenting person. `discord_id` is the identity; everything else is
-    what they said about themselves."""
+    """One consenting person. `discord_id` is the identity (or an `admin-...`
+    key for a hand-added person with no Discord); for a form row everything
+    else is what they said about themselves.
+
+    Every field after `discord_name` has a default, and `from_dict` ignores
+    keys it does not know, so a new optional field is one line here and no
+    migration: old rows simply read back with the default.
+    """
 
     discord_id: str
     discord_name: str
@@ -82,10 +126,32 @@ class Person:
     rather than deleted so that `hotline-registry show` can still explain why an
     agent may not contact somebody it contacted last week -- a missing row and a
     withdrawn consent look identical otherwise."""
+    revoked_reason: str = ""
+    source: str = SOURCE_FORM
+    added_by: str = ""
+    """Discord id of whoever added an `admin` row (the CLI writes `cli:<user>`)."""
+    added_via: str = ""
+    """Where it was added: a Discord channel link and interaction id, or `cli`."""
+    consent_note: str = ""
+    """In the adder's words: how this person agreed to be contacted."""
+    edited_by: str = ""
+    """Set when somebody other than the person changed the row, so a form row
+    whose answers were corrected by hand no longer claims to be in their words."""
+    introduced_at: str = ""
+    """When an agent first reached an `admin` row and said how they got here.
+    Empty means the next contact must carry that line."""
+
+    @property
+    def admin_added(self) -> bool:
+        return self.source == SOURCE_ADMIN
+
+    @property
+    def has_discord(self) -> bool:
+        return bool(self.discord_id) and not self.discord_id.startswith(NO_DISCORD_PREFIX)
 
     @property
     def messageable(self) -> bool:
-        return not self.revoked
+        return self.has_discord and not self.revoked
 
     @property
     def callable_(self) -> bool:
@@ -94,7 +160,8 @@ class Person:
     def channels(self) -> str:
         if self.revoked:
             return "none (revoked)"
-        return "message, call" if self.sip else "message"
+        ways = [w for w, ok in (("message", self.has_discord), ("call", bool(self.sip))) if ok]
+        return ", ".join(ways) or "none (no Discord, no SIP)"
 
     @classmethod
     def from_dict(cls, raw: dict) -> Person:
@@ -157,7 +224,108 @@ class Registry:
             person.registered_at = existing.registered_at
         person.updated_at = _now()
         person.revoked = False
+        person.revoked_reason = ""
         self.people[person.discord_id] = person
+        self.save()
+        return person
+
+    def add_admin(
+        self,
+        name: str,
+        *,
+        consent_note: str,
+        added_by: str,
+        added_via: str,
+        discord_id: str = "",
+        discord_name: str = "",
+        sip: str = "",
+        capabilities: str = "",
+        guild_id: str = "",
+    ) -> Person:
+        """Record somebody Bogdan added by hand.
+
+        Refuses to overwrite a live self-registration: that row holds their own
+        words and their own consent, and an admin add on top of it would
+        replace both with his. `edit` is the way to change one. A revoked row
+        may be re-added -- that is the "unadd, then add back" case.
+        """
+        name = name.strip()
+        consent_note = consent_note.strip()
+        if not name:
+            raise RegistryError("a hand-added person needs a name")
+        if not consent_note:
+            raise RegistryError(
+                "say how they agreed to be contacted (the consent note); "
+                "it is the only consent record a hand-added row has"
+            )
+        discord_id = parse_discord_id(discord_id)
+        sip = normalise_sip(sip)
+        if discord_id:
+            existing = self.people.get(discord_id)
+            if existing is not None and not existing.revoked:
+                raise RegistryError(
+                    f"{existing.name} ({discord_id}) is already in the registry "
+                    f"({existing.source}); edit them instead"
+                )
+            key = discord_id
+        else:
+            key = NO_DISCORD_PREFIX + secrets.token_hex(4)
+        person = Person(
+            discord_id=key,
+            discord_name=discord_name.strip(),
+            name=name,
+            sip=sip,
+            capabilities=capabilities.strip(),
+            guild_id=guild_id,
+            source=SOURCE_ADMIN,
+            added_by=added_by,
+            added_via=added_via,
+            consent_note=consent_note,
+        )
+        self.people[key] = person
+        self.save()
+        return person
+
+    EDITABLE = ("name", "discord_name", "sip", "capabilities", "consent_note", "guild_id")
+
+    def edit(self, key: str, *, edited_by: str, discord_id: str | None = None,
+             **fields: str | None) -> Person:
+        """Change an existing row's fields in place. `None` means "leave it".
+
+        Changing the Discord id re-keys the row (it is the key), which is how a
+        Linphone-only hand-added person gets a Discord account attached later.
+        `registered_at` and `source` never move: an edit is not a new consent.
+        """
+        person = self.people.get(str(key))
+        if person is None:
+            raise RegistryError(f"nobody in the registry has the key {key!r}")
+        unknown = set(fields) - set(self.EDITABLE)
+        if unknown:
+            raise RegistryError(f"cannot edit {', '.join(sorted(unknown))}")
+        if discord_id is not None:
+            new_id = parse_discord_id(discord_id)
+            if not new_id and person.has_discord:
+                raise RegistryError(
+                    "cannot remove a Discord id: it is the row's identity. "
+                    "Revoke the row and add them again instead."
+                )
+            if new_id and new_id != person.discord_id:
+                if new_id in self.people:
+                    raise RegistryError(f"{new_id} is already somebody else's row")
+                del self.people[person.discord_id]
+                person.discord_id = new_id
+                self.people[new_id] = person
+        for name, value in fields.items():
+            if value is None:
+                continue
+            value = value.strip()
+            if name == "sip":
+                value = normalise_sip(value)
+            if name == "name" and not value:
+                raise RegistryError("the name cannot be blank")
+            setattr(person, name, value)
+        person.edited_by = edited_by
+        person.updated_at = _now()
         self.save()
         return person
 
@@ -166,9 +334,16 @@ class Registry:
         if person is None:
             return None
         person.revoked = True
+        person.revoked_reason = why
         person.updated_at = _now()
         self.save()
         return person
+
+    def mark_introduced(self, discord_id: str) -> None:
+        person = self.people.get(str(discord_id))
+        if person is not None and not person.introduced_at:
+            person.introduced_at = _now()
+            self.save()
 
     def all(self, *, include_revoked: bool = False) -> list[Person]:
         people = sorted(self.people.values(), key=lambda p: p.name.lower())
@@ -202,7 +377,8 @@ class Registry:
         if not partial:
             raise RegistryError(
                 f"nobody in the registry matches {query!r}. "
-                "Only people who joined the server and filled the form are in it."
+                "Only people who joined the server and filled the form, or whom Bogdan "
+                "added by hand, are in it."
             )
         names = ", ".join(f"{p.name} ({p.discord_name})" for p in partial)
         raise RegistryError(f"{query!r} matches {len(partial)} people: {names}")
