@@ -92,24 +92,37 @@ def render(people: list[Person]) -> list[str]:
     live = [p for p in people if not p.revoked]
     gone = [p for p in people if p.revoked]
 
-    header = f"**Contact registry — {len(live)} registered**"
+    by_hand = len([p for p in live if p.admin_added])
+    header = f"**Contact registry — {len(live)} registered"
+    if by_hand:
+        header += f", {by_hand} of them added by hand"
+    header += "**"
     if gone:
         header += f" ({len(gone)} revoked)"
-    header += "\nRepublished whenever somebody registers, so this is current."
+    header += ("\nRepublished on every change, so this is current. "
+               "`/registry add`, `/registry edit`, `/registry remove` here to change it.")
 
     blocks = [header]
     for person in sorted(live, key=lambda p: p.name.lower()):
         reach = person.channels() or "nothing — no Discord DM and no SIP"
+        if person.admin_added:
+            origin = (f"· added by hand — consent: {person.consent_note or '(no note)'}"
+                      + ("" if person.introduced_at else " · not introduced yet") + "\n")
+        else:
+            origin = "· self-registered" + (" (edited by hand)" if person.edited_by else "") + "\n"
         blocks.append(
-            f"\n**{person.name}** — {person.discord_name}\n"
+            f"\n**{person.name}** — {person.discord_name or '(no Discord)'}\n"
             f"· reachable by: {reach}\n"
+            + origin +
             f"· SIP: {person.sip or '(none given — do not call)'}\n"
             f"· registered {person.registered_at[:10]}"
             + (f", updated {person.updated_at[:10]}" if person.updated_at[:10] != person.registered_at[:10] else "")
             + f"\n· can do: {person.capabilities or '(said nothing)'}"
         )
     for person in sorted(gone, key=lambda p: p.name.lower()):
-        blocks.append(f"\n~~**{person.name}** — {person.discord_name}~~ · revoked, do not contact")
+        why = f" ({person.revoked_reason})" if person.revoked_reason else ""
+        blocks.append(f"\n~~**{person.name}** — {person.discord_name or '(no Discord)'}~~"
+                      f" · revoked{why}, do not contact")
 
     return _chunk(blocks)
 

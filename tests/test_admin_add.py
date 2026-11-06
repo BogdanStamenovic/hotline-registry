@@ -142,3 +142,17 @@ def test_mark_introduced_is_once(registry):
     assert first
     registry.mark_introduced(person.discord_id)
     assert registry.people[SNOWFLAKE].introduced_at == first
+
+
+def test_the_admin_channel_says_who_was_added_by_hand(registry):
+    from hotline_registry.admin import render
+
+    add(registry, sip="j")
+    registry.revoke("111", "removed by Bogdan")
+    text = "\n".join(render(registry.all(include_revoked=True)))
+    assert "2 registered, 1 of them added by hand**" in text
+    assert "added by hand — consent: agreed on a call" in text and "not introduced yet" in text
+    assert "**Ana** — ana#0\n· reachable by: message\n· self-registered" in text
+    assert "(no Discord)" in text
+    assert "revoked (removed by Bogdan), do not contact" in text
+    assert "/registry add" in text

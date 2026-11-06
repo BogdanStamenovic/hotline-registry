@@ -194,6 +194,12 @@ class Registry:
             str(k): Person.from_dict(v) for k, v in dict(raw.get("people", {})).items()
         }
 
+    # Every mutator reloads first. `hotlined` holds one Registry for its whole
+    # uptime while the CLI writes the same file, so mutating the in-memory copy
+    # would write back a stale roster -- un-revoking somebody the CLI revoked
+    # an hour ago, or dropping a person it added. Reloading shrinks that to the
+    # milliseconds between read and rename; there is no lock, see Limitations.
+
     def save(self) -> None:
         """Write atomically, and never group- or world-readable.
 
@@ -219,6 +225,7 @@ class Registry:
         consented, and a field that silently moves forward every time somebody
         fixes a typo cannot answer "since when".
         """
+        self.load()
         existing = self.people.get(person.discord_id)
         if existing is not None:
             person.registered_at = existing.registered_at
@@ -249,6 +256,7 @@ class Registry:
         replace both with his. `edit` is the way to change one. A revoked row
         may be re-added -- that is the "unadd, then add back" case.
         """
+        self.load()
         name = name.strip()
         consent_note = consent_note.strip()
         if not name:
@@ -296,6 +304,7 @@ class Registry:
         Linphone-only hand-added person gets a Discord account attached later.
         `registered_at` and `source` never move: an edit is not a new consent.
         """
+        self.load()
         person = self.people.get(str(key))
         if person is None:
             raise RegistryError(f"nobody in the registry has the key {key!r}")
@@ -330,6 +339,7 @@ class Registry:
         return person
 
     def revoke(self, discord_id: str, why: str = "") -> Person | None:
+        self.load()
         person = self.people.get(str(discord_id))
         if person is None:
             return None
@@ -340,6 +350,7 @@ class Registry:
         return person
 
     def mark_introduced(self, discord_id: str) -> None:
+        self.load()
         person = self.people.get(str(discord_id))
         if person is not None and not person.introduced_at:
             person.introduced_at = _now()
